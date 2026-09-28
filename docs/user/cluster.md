@@ -1,127 +1,344 @@
 # Running on a Cluster
 
-When local laptop time isn't enough, the same project runs on a SLURM
-HPC system. There is no separate configuration to learn and no flag to
-pass — `lc materialize` detects where it is running, and the allocation
-you request *is* the resource declaration.
+Allocate compute explicitly, then pass the returned cluster name to either execution
+command. The same commands work for a local workstation and Slurm. No cluster is
+started by `lc run` or `lc materialize`, even when Slurm environment variables are
+present. `lc materialize --check` and `lc status` remain local project inspection.
 
-## The big picture
+## Start locally
 
-`lc materialize` runs its tasks through a scheduler, and picks the venue
-by looking at the environment:
-
-1. **Inside a SLURM allocation** (`SLURM_JOB_ID` is set) → the run
-   spans every node the allocation holds: one worker per node, launched
-   via `srun`, using every core it was granted.
-2. **Anywhere else** → the local machine, using every core.
-
-You already answered every sizing question at `salloc` / `sbatch` —
-how many nodes, which constraint, how long — so `lc` asks none of its
-own. There is no `--jobs`, no worker count, no venue config file.
-
-## A typical SLURM workflow
-
-### 1. Prepare on the login node
-
-Everything except executing recipes works on a login node — and one
-verb is *for* it:
+No configuration is needed on a fresh installation. When
+`~/.lightcone/compute.yaml` is absent, Lightcone exposes one built-in `local` offer:
+one logical CPU, 1 GiB, one node, and fast startup. Its default lifetime is
+30 minutes, with a maximum of two hours. This creates no catalog file and starts
+no processes until you launch a cluster.
 
 ```bash
-cd $SCRATCH/my-analysis
-lc materialize --check     # what would run, and why
-lc status                  # where every output stands
-lc build                   # containerized projects: build + commit the image
+lc compute resources
+lc compute launch --cpus 1 --memory 1 --dry-run
+CLUSTER=$(lc compute launch --cpus 1 --memory 1)
+lc compute status "$CLUSTER" --wait
+lc run "$CLUSTER" -- python -c 'print("hello from the cluster")'
+lc materialize "$CLUSTER"
+lc compute down "$CLUSTER"
 ```
 
-### 2. Get an allocation and materialize inside it
+Run the execution commands from your project root. A launch returns when native
+allocation is accepted; `status --wait` waits for Dask readiness. Execution never
+waits: `lc run` and `lc materialize` refuse a cluster that is not active with
+every expected worker connected, for example:
 
-=== "Interactive"
-    ```bash
-    salloc --nodes=1 --constraint=cpu --qos=interactive --time=02:00:00
-    # salloc drops you onto a compute node; from there:
-    cd $SCRATCH/my-analysis
-    lc materialize
-    ```
-
-=== "Batch"
-    ```bash
-    cd $SCRATCH/my-analysis
-    sbatch --nodes=1 --constraint=cpu --qos=regular --time=02:00:00 \
-        --wrap 'lc materialize'
-    ```
-
-    (Make sure `lc` is on `PATH` in the batch environment — with a
-    `uv tool install`, that's `export PATH=$HOME/.local/bin:$PATH` in
-    the script if your shell profile doesn't already do it.)
-
-Ask for more nodes and the run uses them — independent outputs and
-universes spread across the allocation with nothing else to say.
-
-### 3. Guard rails on known centers
-
-On centers `lc` knows (NERSC today), running `lc materialize` on a
-login node refuses with the center's own allocation spellings rather
-than quietly hammering a shared node:
-
-```
-Error: lc materialize executes recipes on compute nodes, and this is a
-NERSC login node (NERSC_HOST is set with no SLURM allocation active).
-
-Get an allocation and run it there:
-
-  interactive:
-      salloc --nodes=1 --constraint=cpu --qos=interactive --time=02:00:00
-      lc materialize
-
-  batch (from the project root):
-      sbatch --nodes=1 --constraint=cpu --qos=regular --time=02:00:00 \
-          --wrap 'lc materialize'
-
-lc materialize --check, lc status and lc run work anywhere.
+```text
+Error: this allocation's Dask scheduler has not started yet; wait for readiness with `lc compute status CLUSTER --wait`
 ```
 
-The read-only verbs are exempt on purpose — a login node is exactly
-where "where does this project stand?" gets asked.
+Finishing a run detaches its client and leaves the cluster available for another
+command. The allocation ends at its time limit or when you call `down`.
 
-## Containers on HPC
+`lc compute status` lists allocations as `name: status`, one per line.
+Use `lc compute status NAME` for resource details and Dask readiness.
 
-A containerized project (one with `[tool.lightcone.image]` in its
-`pyproject.toml`) works the same way, with three site realities to
-know:
+## Local allocations
 
-- **`podman-hpc` is detected first.** Sites install it precisely
-  because plain podman's image store is invisible to compute nodes;
-  where both exist, `lc` prefers the wrapper and runs its extra
-  `migrate` step automatically, so the image is readable from every
-  node.
-- **Build on a login node, once.** `lc build` builds the image and
-  commits it into the repository as versioned content — compute nodes
-  never build and need no registry access; an unfetched image arrives
-  through the annex like any other data. The archive records the
-  architecture it was built for, and a mismatched host is refused
-  before anything runs — so build where the architecture matches the
-  compute nodes (on NERSC, a login node).
-- **Multi-node runs require a shared image store.** With plain podman
-  or docker the image exists only on the driver's node, so `lc`
-  refuses a multi-node containerized run unless the runtime is
-  `podman-hpc`. Single-node allocations work with any runtime.
+Local resources are cooperative limits, not an exclusive CPU/RAM reservation.
+An allocation owns a detached process session and standard `LocalCluster`: one
+worker process with `task_slots_per_node` threads, and a scheduler that listens
+on `127.0.0.1` over TLS. Its own logs are discarded; a startup failure is kept
+and shown as the reason by `lc compute status`. At its time limit the whole
+process session is killed with SIGKILL, so a recipe still running stops mid-write.
+`down` sends SIGTERM, waits three seconds, then sends SIGKILL.
+Private process locators are checked against the native boot UUID, UID, process
+session, and exact command containing the allocation's random token before
+attachment or termination. Hostname changes and clock adjustments do not change
+that identity. Manage a local allocation from the host and boot session that
+launched it. Other boot sessions are excluded from discovery, and an explicit
+ID from one is refused rather than reported as stopped. Once an allocation has
+ended, its credentials and scratch directory are removed; its full ID still
+reports `ended`.
+Local compute is available wherever the catalog exposes a valid local offer;
+Lightcone does not infer permission from login-node names or site environment
+variables. Allocation choices are explicit and native permissions still apply.
 
-## Data on parallel filesystems
+A local connection's optional `launch` settings are `connection_root` (default
+`~/.lightcone/compute`), `scratch_root` (default: the temporary directory),
+`python` (default: the interpreter running `lc`), and `task_slots_per_node`
+(default: all of the offer's CPUs). A local connection's `context`, when set, is
+the hostname it belongs to. Local offers take no `config`.
 
-Keep active projects on the filesystem your center recommends for job
-I/O (`$SCRATCH` on NERSC), and remember scratch purge policies — the
-project is a git repository, so `git push` to a remote (and
-`git annex copy --to` for the bytes) is the durable copy.
+## Cluster names
 
-!!! warning "Early days"
-    HPC support is the youngest part of lightcone-cli and has not yet
-    been broadly validated on production systems. If something refuses,
-    hangs, or surprises you on your center, please
-    [open an issue](https://github.com/LightconeResearch/lightcone-cli/issues)
-    — site reports are exactly what this layer needs right now.
+Choose a name at launch, or omit `--name` to generate a short name such as
+`lc-a1b2c3d4e5f6`:
 
-## Where to next
+```bash
+lc compute launch --name analysis --cpus 1 --memory 1
+lc compute status analysis --wait
+lc compute down analysis
+```
 
-- [Core Concepts](concepts.md) — the model all of this rests on.
-- [Troubleshooting](troubleshooting.md) — the refusals, quoted, with
-  remedies.
+Names contain 1–63 lowercase ASCII letters, digits, or hyphens, starting with a
+letter and ending with a letter or digit. Launch writes only the name to stdout;
+readiness guidance goes to stderr. All execution and lifecycle commands accept
+either that name or the full immutable ID available in launch and status JSON.
+
+Names are checked against current allocations across all configured connections
+before launch. An explicit duplicate is refused, and an autogenerated collision
+is regenerated before submission. Discovery failures prevent this check from
+succeeding. Concurrent launches can still choose the same name, so lookup also
+refuses ambiguous names or incomplete discovery. Use a full ID to select a known
+allocation directly when another connection cannot be queried.
+
+A name may be reused once its allocation has ended. Keep the full ID when you
+need a durable reference to one allocation; a later cluster with the same name
+has a different ID. Names are discovered from allocation metadata, without a
+separate name registry. Native state still decides whether an allocation exists.
+
+## Customize resource offers
+
+Create `~/.lightcone/compute.yaml` to expose other resource shapes or services.
+A configured catalog replaces the built-in catalog completely; no extra local
+offer is added to it. The namespace is a stable UUID identifying a connection;
+keep it unchanged while that connection's clusters exist.
+
+For example, this catalog exposes a larger local allocation:
+
+```yaml
+version: 1
+connections:
+  workstation:
+    namespace: 22c84e48-2f0a-4cd2-90a2-30ce2e909bd1
+    provider: local
+offers:
+  - name: workstation
+    connection: workstation
+    resources: {cpus: 4, memory: 8}
+    max_nodes: 1
+    time: {default: 30m, max: 2h}
+    startup: {class: fast}
+```
+
+Set `LC_COMPUTE_CONFIG` to choose another file for all commands, including
+`lc run` and `lc materialize`, which find clusters through the same catalog. A
+missing explicit path or an invalid catalog is an error; only an absent implicit default file
+selects the built-in offer. Stop existing built-in allocations before replacing
+their connection with your own catalog.
+
+This example keeps the built-in connection's namespace, so allocations launched
+from the built-in offer stay visible and can still be stopped after the file
+exists.
+
+A catalog has `version: 1`, a `connections` mapping, and an ordered `offers`
+list:
+
+- A connection has a `namespace` (a UUID), a `provider` (`local` or `slurm`), an
+  optional `context`, and optional provider `launch` settings. Namespaces must
+  be unique, and so must each provider/`context` pair.
+- An offer has a unique `name`, the `connection` it uses, per-node `resources`
+  (`cpus` and `memory` in GiB), `max_nodes`, and `time` with a `default` no
+  longer than its `max`. `startup` is optional (`fast`, `batch`, or the default
+  `unknown`), written either as a bare class or as `{class: …, source: …}`.
+  `config` holds provider-specific settings.
+
+Catalog errors identify the invalid field, for example `offers.0.resources.cpus`.
+Unknown common fields and duplicate YAML keys are rejected. CPU and node counts
+must be positive integers; memory is in GiB and may be fractional if it is an
+exact number of bytes, and durations use minutes or hours such as `30m` or `2h`.
+
+Selection takes the first offer in catalog order that matches the request. An
+offer this host cannot provide is skipped: a local offer with more nodes, CPUs or
+memory than the host has, or whose `context` names another host. When nothing
+matches, the error lists why each skipped offer was unavailable:
+
+```text
+Error: no configured offer matches this resource request; see lc compute resources; huge: the local offer exceeds this host's CPU or RAM capacity
+```
+
+## Configure Slurm
+
+The CLI runs the native `sbatch`, `salloc`, `squeue`, `sacct`, `scontrol`, and
+`scancel` commands as the current user. It needs a compatible Slurm client
+installation and access to the selected service. `context` is the native Slurm
+cluster name; omit it to use the current service.
+
+Those commands run without inherited request settings: every `SBATCH_*`,
+`SALLOC_*`, `SRUN_*`, `SQUEUE_*`, `SACCT_*`, `SCANCEL_*`, and `SLURM_*` variable
+is removed, except `SLURM_CONF`, `SLURM_CONF_SERVER`, and `SLURM_JWT`. An
+`SBATCH_ACCOUNT` in your shell profile therefore has no effect; put the account
+in the offer.
+
+This illustrative NERSC configuration requires a deployment-specific account and
+resource sizing. It has not been validated by submitting a job at NERSC:
+
+```yaml
+version: 1
+connections:
+  perlmutter:
+    namespace: 9d0c0fc5-9be8-407a-a3ec-f17c4110b162
+    provider: slurm
+    context: perlmutter
+
+offers:
+  - name: quick
+    connection: perlmutter
+    resources: {cpus: 256, memory: 480}
+    max_nodes: 2
+    time: {default: 1h, max: 4h}
+    startup: {class: fast}
+    config:
+      submit: salloc
+      account: myproject
+      constraint: cpu
+      qos: interactive
+  - name: batch
+    connection: perlmutter
+    resources: {cpus: 256, memory: 480}
+    max_nodes: 16
+    time: {default: 1h, max: 12h}
+    startup: {class: batch}
+    config:
+      submit: sbatch
+      account: myproject
+      constraint: cpu
+      qos: regular
+```
+
+An offer's `config` accepts `submit` (`sbatch`, the default, or `salloc`),
+`account`, `partition`, `qos`, `constraint`, and `reservation`. Slurm offers must
+state memory as a whole number of MiB.
+
+Every setting under a Slurm connection's `launch` mapping is optional. The
+defaults assume a home directory that the login and compute nodes share:
+
+- `python`: the interpreter that ran `lc compute launch`, so workers use the
+  driver's own Lightcone installation. `uv tool install lightcone-cli` places it
+  under `$HOME`. Avoid launching through `uvx`, whose environment lives in uv's
+  cache and can be pruned while the allocation runs.
+- `connection_root`: `~/.lightcone/compute`. The scheduler's connection files,
+  TLS credentials, and batch logs live in private directories there, which the
+  driver and every node must reach.
+- `scratch_root`: each node's own temporary directory (`$TMPDIR`, usually
+  `/tmp`), which holds the Dask workers' files.
+- `cwd`: your home directory, as the job's working directory.
+- `task_slots_per_node`: one fewer than the offer's CPUs, leaving room for the
+  scheduler. Lower it when recipes are multithreaded or memory-heavy.
+- `interface`: unset, so Dask listens on the node's hostname. Name a network
+  interface instead if nodes cannot reach each other by hostname; Perlmutter's
+  high-speed network is `hsn0`.
+
+The offered CPU and memory shape is per node. Bare resource quantities request an
+exact match; a trailing `+` permits a larger offered shape. Selection takes the
+first eligible offer in catalog order. `--startup fast` filters to that service
+class; it does not guarantee a queue wait. Inspect the resolved plan before launch:
+
+```bash
+lc compute launch --cpus 32+ --memory 128+ --num-nodes 2 --time 1h --dry-run
+```
+
+One allocation contains one `srun` step with one process per node, bound with
+`--cpu-bind=threads` to exactly the hardware threads Slurm allocated. Rank zero
+composes standard Dask `Scheduler` and `Worker` objects, and every other rank
+starts a standard `Worker`. A one-node allocation has both scheduler and worker.
+Neither serves a dashboard or any other HTTP route.
+The scheduler consumes part of the offered resources; `task_slots_per_node`
+controls Dask task concurrency independently of the allocation's logical CPUs.
+Dask memory management is disabled because recipes run in external subprocesses;
+Slurm supplies allocation containment and memory enforcement. Lightcone always
+requests a finite native `--time`. Actual termination follows Slurm's
+`OverTimeLimit` and `KillWait` policy, which can permit an unlimited overrun.
+Lightcone does not impose an independent Slurm runtime deadline or require a
+preflight time-policy query.
+
+`config.partition` is optional. Lightcone passes `--partition` only when it is
+explicitly configured; otherwise the site selects the partition. Omit it at
+NERSC so site routing can select from the QOS and constraint. During deployment
+testing, inspect the submitted job's actual `Partition` with `scontrol show job`.
+[NERSC's workflow guidance](https://docs.nersc.gov/jobs/workflow/maestro/)
+describes its QOS-driven partition selection.
+
+At NERSC, move uv's cache off `$HOME` before launching. Every recipe and probe
+runs through `uv run`, which locks uv's cache, and Perlmutter's compute nodes
+cannot lock files in `$HOME`, where the cache lives by default. Workers inherit
+the environment `lc compute launch` runs in, so set the variable there, for
+example in your shell profile:
+
+```bash
+export UV_CACHE_DIR=$PSCRATCH/uv-cache
+```
+
+An allocation launched without it has to be relaunched. `$PSCRATCH` is purged
+when idle; a purged cache is only downloaded again.
+
+Slurm displays `lc-v1-<name>` as the job name, for example `lc-v1-analysis`.
+Its native comment carries the random submission token as
+`lightcone:v1:kind=dask:token=<32hex>`. Lightcone verifies the name, token, and owner
+before attaching or cancelling; a job name alone does not establish identity.
+The opaque cluster ID encodes the connection namespace, native job ID, token,
+and name. There is no job registry to reconcile. Removing an offer prevents new launches without
+hiding existing jobs; retain its connection to inspect and terminate them.
+Native job state and live Dask readiness are separate observations. A worker loss
+can leave a job active but not ready. Unknown native state is reported as unknown.
+
+Live discovery requires the native comment. Historical inspection also needs
+Slurm accounting to retain it through `AccountingStoreFlags=job_comment`.
+If accounting has no matching token, Lightcone reports unknown rather than
+assuming the allocation ended or cancelling a job with a reused ID.
+[Slurm documents this comment-retention setting](https://slurm.schedmd.com/sacct.html).
+
+An `salloc` launch retains native `salloc`/`srun` processes on the submit host.
+Its survival across logout, Jupyter shutdown, and site session cleanup must be
+checked on the deployment. Batch jobs are independent of the submitting CLI.
+An ambiguous submission reports its token; inspect native state before retrying,
+since the original allocation may have been accepted.
+
+A batch launch submits with `sbatch --parsable --no-requeue`. An `salloc` launch
+starts `salloc --kill-command=TERM` detached and returns once Slurm lists the job,
+waiting at most ten seconds. Everything lives under the connection root:
+
+- Submission logs: `submissions/<token>/<job-id>.out` for `sbatch`, or
+  `submissions/<token>/salloc.log`.
+- Scheduler connection files and TLS credentials:
+  `<namespace>/<job-id>-<token>/attempt-<restarts>/`.
+
+Each worker's files go under `<scratch>/<token>/attempt-<restarts>/<rank>`.
+
+Before starting Dask, every rank checks that Slurm gave it what the plan
+requested: the node count, CPUs per task and its actual CPU affinity, and memory
+per node. Ranks other than zero wait up to 120 seconds for the scheduler, which
+has as long to start. A failed check or timeout logs
+`Slurm Dask startup failed: …` to the submission log and exits nonzero. Look
+there when a job is active but never becomes ready.
+
+## Execution requirements and limits
+
+Driver and workers must see the same project, prepared environment, and inputs
+at the same absolute paths. They need matching Lightcone code, Python major/minor,
+and Dask versions. By default, Slurm workers run the driver's own installation
+(see the `python` launch setting above). Relaunch allocations after upgrading
+the worker installation.
+Commands and recipes are ordinary tasks submitted to the Dask
+scheduler, which chooses their workers; task runtime and sandbox checks still
+apply. Recipe output is forwarded to the invoking terminal on stderr; `run`
+preserves the command's stdout and stderr bytes separately.
+Containerized projects also require the prepared image and runtime on each
+worker; `podman-hpc` can expose its migrated image across NERSC nodes.
+Direct recipes inherit the allocation workers' environment, not variables added
+to the invoking CLI after launch. Remote execution does not forward stdin.
+
+The catalog contains policy, not credentials or live state. Scheduler connection
+material is private and uses standard Dask TLS and scheduler files. Configured
+connection and scratch roots can contain symlinks, including a symlinked home
+directory: Lightcone resolves the root before appending managed paths. Allocation
+directories and credential files still reject symlinks, retain ownership and
+ancestor-permission checks, and require modes `0700` and `0600`, respectively.
+The catalog's location is independent of the private connection files.
+
+Use one execution invocation per project at a time. Concurrent writers,
+comprehensive cancellation, task fencing, and recovery after client/worker loss
+are not guaranteed. A lost client does not prove its subprocesses stopped.
+Unreported partial outputs are retained after interruption rather than restored
+while a task may still write them. End the allocation and establish that work has
+stopped before inspecting or repairing that project's outputs.
+For local containerized execution, `down` and walltime expiry stop the managed
+process group but do not guarantee termination of containers managed by an
+external runtime. A Podman container that ignores SIGTERM can survive. Inspect
+and stop such containers through the container runtime before cleaning results.

@@ -35,19 +35,20 @@ imports.
 ## One run, end to end
 
 ```text
-lc materialize
-  │  guard: compute node?  tools?  git identity?
+lc materialize "$CLUSTER"
+  │  guard: tools?  git identity?
   │  refuse: dirty tree
-  │  converge: uv.lock ⇄ .venv   (and the image, containerized)
   │  plan: astra validate + resolve  →  Graph of Tasks
+  │        (no tasks → converge the crate and stop; nothing connects)
+  │  connect: native identity + Dask readiness
   │  fetch: git annex get (declared inputs not in this clone)
-  │  venue: SLURM allocation? → srun workers · else LocalCluster
-  ├─► workers: reset output dir → sandbox → recipe → hash → manifest
+  │  converge: uv.lock ⇄ .venv   (and the image, containerized)
+  ├─► workers: reset output file → sandbox → recipe → hash → manifest
   │            (never raise; return ok/current/behind/failed/blocked)
   └─  driver: consume results in one thread
         ok      → dataset.save   (commit + run record)
         failed  → dataset.restore (tree as clean as it started)
-        finally → converge ro-crate-metadata.json (if licensed)
+        then    → converge ro-crate-metadata.json (if licensed)
 ```
 
 The division of labor is strict and load-bearing:
@@ -151,16 +152,24 @@ environment sync and each recipe exec, over a read-only rootfs with
 the mount table as the whole policy. Execution pins the archive's
 config-blob id, never a tag.
 
-## Venues
+## Compute allocations
 
-`materialize.cluster_for_run()` is the one place that decides where a
-run executes, and the seam it returns is two methods wide —
-`submit(fn, *args, key=…)` and `completed(handles)`. A SLURM
-allocation (detected by `SLURM_JOB_ID`) gets one worker per node via a
-single `srun`, running the driver's own interpreter so driver and
-workers are the identical installation. Anything else is the local
-machine. Venues are detected, never configured; the only venue config
-that exists is the allocation the user already requested.
+`engine.compute` owns allocation lifecycle through a small provider protocol.
+A YAML catalog supplies ordered resource offers and stable native service
+namespaces. When the implicit default file is absent, a built-in local catalog
+provides one CPU and 1 GiB without setup. An explicit catalog replaces that default;
+missing explicit paths and invalid files remain errors. No catalog is written and
+no allocation starts until `compute launch` resolves resources and submits once. Slurm queries
+and validated local OS identities are authoritative for allocations; Dask is the
+authority for connected workers. Private scheduler/TLS files are connection
+material, not a registry.
+
+`compute.connect(CLUSTER_ID)` borrows a standard Dask client and closes only that
+client on exit. Both execution commands require a cluster ID. The materialization
+scheduler keeps its `submit`/`completed` seam. Driver preparation and existing
+task runtime/sandbox checks remain unchanged. Tasks use ordinary Dask scheduling;
+there is no separate worker-selection or preflight layer, or site-marker guard. No execution command implicitly allocates compute.
+See [compute internals](api/compute.md) and [deployment limits](user/cluster.md).
 
 ## The publication view
 
@@ -190,7 +199,7 @@ src/lightcone/              # namespace — NO __init__.py
     ├── worker.py           # making one output; the rerun entry point
     ├── materialize.py      # the driver: gates, Dask, the save/restore loop
     ├── run.py              # what `lc run` is
-    ├── venue.py            # where a run executes
+    ├── compute/            # common allocation API, local and Slurm providers
     ├── sandbox/            # the exec boundary
     └── templates/          # the scaffold's file content, as real files
 ```

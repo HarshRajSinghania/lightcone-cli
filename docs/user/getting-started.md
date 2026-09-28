@@ -249,11 +249,25 @@ the record of what your results were computed with.
 
 ## 5. Materialize
 
+Launch the built-in local offer; no compute configuration is needed. It provides
+one CPU and 1 GiB for 30 minutes. Keep the returned ID in `CLUSTER` for this
+walkthrough. If you already have a compute catalog, its offers replace that default;
+see [Running on a Cluster](cluster.md).
+
+```bash
+CLUSTER=$(lc compute launch --cpus 1 --memory 1 --json | python -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+lc compute status "$CLUSTER" --wait
+```
+
+Execution always requires this cluster ID. `lc materialize --check` can inspect
+what needs rebuilding without allocating compute. If the allocation expires
+during the walkthrough, launch another one and replace `CLUSTER` with its new ID.
+
 Commit, then build:
 
 ```bash
 git add -A && git commit -m "Line-fit analysis"
-lc materialize
+lc materialize "$CLUSTER"
 ```
 
 The commit isn't ceremony — every output is committed together with the
@@ -313,7 +327,7 @@ Commit and materialize again:
 
 ```bash
 git add -A && git commit -m "Add the robust universe"
-lc materialize
+lc materialize "$CLUSTER"
 ```
 
 ```
@@ -349,7 +363,7 @@ then commit and materialize once more:
 
 ```bash
 git add -A && git commit -m "Declare a license"
-lc materialize
+lc materialize "$CLUSTER"
 ```
 
 Nothing is rebuilt — but `ro-crate-metadata.json` appears at the project
@@ -378,7 +392,7 @@ repository you already have.
 
 Clone this repository on a fresh machine, run `lc init` (it rebuilds
 the two pieces of local state git doesn't carry — the `.venv` and the
-annex), then `lc materialize`: it reports up to date without fetching a
+annex), then `lc materialize --check`: it reports up to date without fetching a
 single data byte, because the provenance travels in git. The bytes
 themselves follow with `git annex get` whenever you actually need them.
 
@@ -392,3 +406,5 @@ themselves follow with `git annex get` whenever you actually need them.
   in plain language.
 - The [ASTRA docs](https://astra-spec.org/latest/) — the full spec:
   sub-analyses, prior insights, findings, and evidence.
+
+Release the allocation when finished: `lc compute down "$CLUSTER"`.

@@ -9,19 +9,43 @@ question.
 ## Synopsis
 
 ```text
-lc run COMMAND...
+lc run CLUSTER -- COMMAND...
 ```
 
-Everything after `run` is the command, verbatim — flags included.
+The first argument is a cluster name or full immutable ID from `lc compute launch`.
+Everything after `--` is the command, verbatim — flags included.
 Argv, the `docker run` / `uv run` convention: a single quoted string
 would be exec'd as one filename, so probe shell syntax through
-`bash -c` instead. `lc run` takes no options of its own, so nothing
-else needs escaping:
+`bash -c` instead. Set `CLUSTER` to your allocated cluster's name or full ID:
 
 ```bash
-lc run python -c "import numpy; print(numpy.__version__)"
-lc run python src/fit.py --points data/points.csv --outliers keep --output /tmp/probe
+lc run "$CLUSTER" -- python -c "import numpy; print(numpy.__version__)"
+lc run "$CLUSTER" -- python src/fit.py --points data/points.csv --outliers keep --output /tmp/probe
 ```
+
+The command is submitted as an ordinary task to the cluster's Dask scheduler,
+which chooses a worker. The command uses the prepared project environment and
+the same sandbox as a recipe. stdout/stderr are forwarded as bytes, preserving binary output and
+line endings when redirected. The client detaches on completion; the allocation
+stays available until `lc compute down` or its time limit. A missing cluster,
+or one that is not yet active with every expected worker connected, is an
+error: nothing waits and nothing runs locally instead. Use
+`lc compute status CLUSTER --wait` first. See [compute](compute.md).
+
+The command receives EOF on stdin; terminal input and pipes into `lc run` are not
+forwarded. Pass input files through the project's declared inputs instead.
+For direct execution, ambient environment variables come from the worker's
+allocation environment. Prefixing the CLI with `NAME=value` does not forward
+that variable to an existing cluster. Set command-specific values inside the
+command, for example `lc run "$CLUSTER" -- env NAME=value python script.py`.
+Containerized commands use the image's environment and the sandbox overlays.
+
+Interrupting the CLI detaches its client; the remote command may still be running.
+Stop the allocation with `lc compute down` and its full ID (a name can already
+belong to a newer allocation) before working with files the interrupted command
+could still be writing. Confirm that the command has
+stopped; local containers may require separate termination through their runtime
+(see [execution limits](../user/cluster.md#execution-requirements-and-limits)).
 
 ## What it does
 
@@ -55,7 +79,7 @@ and the fix (declare the dependency) is the same in both places.
 ## Examples
 
 ```bash
-lc run python -c "import scipy"        # is the package in the lock?
-lc run bash -c 'echo $HOME'            # see the private HOME a recipe gets
-lc run python src/fit.py --help        # exercise a script exactly as a recipe would
+lc run "$CLUSTER" -- python -c "import scipy"        # is the package in the lock?
+lc run "$CLUSTER" -- bash -c 'echo $HOME'            # see the private HOME a recipe gets
+lc run "$CLUSTER" -- python src/fit.py --help        # exercise a script exactly as a recipe would
 ```
