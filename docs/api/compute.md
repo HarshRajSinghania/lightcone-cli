@@ -7,7 +7,7 @@ It owns no service, registry, or saved current-cluster selection.
 | Symbol | Contract |
 |---|---|
 | `Request.parse(...)` | Exact/minimum CPU and memory requests, exact accelerator type/count, node count, walltime, startup class. |
-| `Catalog.load(path)` | Ordered fixed shapes and stable connection namespaces; use the built-in local catalog only when the implicit default file is absent. |
+| `Catalog.load(path)` | Ordered fixed shapes and stable connection namespaces; apply local defaults or disable policy alongside configured offers. |
 | `Compute.plan(request, *, name=None)` | Select an eligible offer and freeze its native launch settings and optional name without allocation. |
 | `Compute.launch(plan)` | Check names across native authorities, generate one if omitted, submit once, and return a self-contained `Identity`. |
 | `Compute.discover()` | Snapshots and per-connection errors, querying each authority once. |
@@ -16,14 +16,26 @@ It owns no service, registry, or saved current-cluster selection.
 | `connect(cluster_id, timeout=10)` | Resolve a name or full ID; borrow a standard Dask client, closing the client but never the allocation. |
 | `Provider` | `plan`, `launch`, `discover`, `inspect`, `connect`, `terminate`. |
 
-`Catalog.load()` defaults to `~/.lightcone/compute.yaml`. When that implicit file
-is absent, the built-in catalog exposes a `local` offer: one CPU, 1 GiB, one node,
-fast startup, 30-minute default and two-hour maximum lifetime. GPU offers require
-an explicit catalog. It creates no configuration file or allocation. Configured
-catalogs replace it completely.
+`Catalog.load()` defaults to `~/.lightcone/compute.yaml`. The built-in `local`
+offer uses detected usable CPUs and RAM, one node, fast startup, and a 30-minute
+default/two-hour maximum lifetime. `local.resources` overrides its CPU/RAM budget;
+`local.enabled: false` blocks local launch and execution while retaining connections
+for inspection and termination. Remote catalogs retain the implicit local offer
+unless disabled. Explicit local connections supply their own offers instead and
+cannot be combined with `local.resources`. GPU offers require explicit configuration.
+Loading creates no configuration file or allocation.
+The effective local policy also disables local offers on recognized NERSC login
+nodes: nonempty `NERSC_HOST` and a short hostname matching `login[0-9]+`.
+Explicit enablement and Slurm job environment variables do not override this
+guard; interactive compute nodes remain eligible. Local planning, launch, and
+execution check the same policy, while status and termination remain available.
 Missing paths selected through an argument or `LC_COMPUTE_CONFIG`, unreadable
 files, and invalid catalogs remain errors. Stable connection namespaces let
 separate invocations discover and attach to the same local allocations.
+
+`Compute.plan_local()` selects only local offers and defaults the name to `local`.
+CLI `launch --wait` waits through `Compute.status` using the accepted immutable ID;
+errors retain that ID without resubmission or termination.
 
 `model.py` defines the shared Pydantic models: `Connection`, `Offer`, `Resources`, `Accelerator`,
 `TimeLimits`, `Startup`, `Request`, `Identity`, `LaunchPlan`, and `Snapshot`.
@@ -136,7 +148,8 @@ See [Slurm's accounting field documentation](https://slurm.schedmd.com/sacct.htm
 Execution submits ordinary tasks through the borrowed client's `submit` method.
 Dask chooses the workers and handles dependencies; invocation-specific keys prevent
 unintended reuse across commands. There is no worker-selection layer, per-worker
-preflight orchestration, source fingerprinting, or login-node guard. Driver-side
+preflight orchestration, or source fingerprinting. The local login-node guard
+does not restrict remote Slurm execution from a login node. Driver-side
 preparation and the existing task runtime/sandbox checks remain in their owners.
 
 Workers advertise standard Dask `CPU`, `MEMORY`, and `GPU` resources; memory is measured
@@ -207,6 +220,27 @@ topic, which the schedulers lc launches drop as soon as the client disconnects
 command. A driver that exits before every task reports says so with
 `UNSTOPPED`: closing a client cannot prove that a remote subprocess stopped. Probes preserve both streams;
 materialization sends recipe output to stderr to leave stdout for its report.
+
+Local allocations are limited to one per user on each machine, independent of
+connection roots and namespaces. Before spawning, the launcher scans the process
+table for a live owner of the same user: a session leader running `-P -m
+lightcone.engine.compute.local_runtime <directory>`, which excludes workers forked
+from it. The process table spans every catalog and connection root and needs no
+file lock, which some shared home filesystems, NERSC's included, do not support.
+The owner's directory argument locates its identity record, so a refused launch
+names the running cluster, its connection root, and the catalog it was launched
+with. A record not yet written means the owner is still starting; one that is
+missing or unreadable after that never recovers, so the refusal names the
+owner's PID instead. Two limits are accepted rather than closed with a lock:
+launches that overlap can both pass the scan, and the scan covers one PID
+namespace, so a container sharing the home directory does not see the host's
+owner.
+
+A startup pipe lets the owner proceed only after the launcher publishes its
+identity and launch records. If the launcher dies before completing publication,
+the pipe closes and the owner exits. Failures before identity
+publication remove the launcher's private files; a published identity remains
+inspectable after a startup failure.
 
 Local teardown drains the allocation's validated process group rather than
 assuming the owner's exit proves every child stopped. Boot UUID, UID, process
