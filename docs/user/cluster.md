@@ -8,10 +8,12 @@ present. `lc materialize --check` and `lc status` remain local project inspectio
 ## Start locally
 
 No configuration is needed on a fresh installation. When
-`~/.lightcone/compute.yaml` is absent, Lightcone exposes one built-in `local` offer:
+`~/.lightcone/compute.yaml` is absent, Lightcone exposes a built-in `local` CPU offer:
 one logical CPU, 1 GiB, one node, and fast startup. Its default lifetime is
 30 minutes, with a maximum of two hours. This creates no catalog file and starts
 no processes until you launch a cluster.
+Use a custom catalog for larger CPU or RAM budgets and for GPU offers.
+See [GPU allocations](#gpu-allocations).
 
 ```bash
 lc compute resources
@@ -134,15 +136,20 @@ list:
   optional `context`, and optional provider `launch` settings. Namespaces must
   be unique, and so must each provider/`context` pair.
 - An offer has a unique `name`, the `connection` it uses, per-node `resources`
-  (`cpus` and `memory` in GiB), `max_nodes`, and `time` with a `default` no
-  longer than its `max`. `startup` is optional (`fast`, `batch`, or the default
+  (`cpus`, `memory`, and optional `accelerators`), `max_nodes`, and `time` with a
+  `default` no longer than its `max`. `startup` is optional (`fast`, `batch`, or the default
   `unknown`), written either as a bare class or as `{class: …, source: …}`.
   `config` holds provider-specific settings.
 
 Catalog errors identify the invalid field, for example `offers.0.resources.cpus`.
 Unknown common fields and duplicate YAML keys are rejected. CPU and node counts
-must be positive integers; memory is in GiB and may be fractional if it is an
-exact number of bytes, and durations use minutes or hours such as `30m` or `2h`.
+must be positive integers. Compute memory follows SkyPilot's binary-unit
+convention: `32`, `32GB`, and `32GiB` mean 32 GiB. Fractional quantities must
+represent an exact number of bytes. An accelerator declaration names one type
+and a positive whole count: `accelerators: A100:4` or `accelerators: {A100: 4}`;
+`accelerators: A100` means one. Omit it for CPU-only offers. Durations use ordered
+day/hour/minute/second units, such as
+`30m`, `1h30m`, or `45s`.
 
 Selection takes the first offer in catalog order that matches the request. An
 offer this host cannot provide is skipped: a local offer with more nodes, CPUs or
@@ -203,8 +210,11 @@ offers:
 ```
 
 An offer's `config` accepts `submit` (`sbatch`, the default, or `salloc`),
-`account`, `partition`, `qos`, `constraint`, and `reservation`. Slurm offers must
-state memory as a whole number of MiB.
+`account`, `partition`, `qos`, `constraint`, `reservation`, and `gpu_type`.
+For a named accelerator offer, `gpu_type` maps the public type to the site's
+native Slurm GRES name; it is required even when the spellings happen to match.
+A generic `GPU` offer may omit it. Slurm offers must state memory as a whole
+number of MiB.
 
 Every setting under a Slurm connection's `launch` mapping is optional. The
 defaults assume a home directory that the login and compute nodes share:
@@ -303,10 +313,148 @@ Each worker's files go under `<scratch>/<token>/attempt-<restarts>/<rank>`.
 
 Before starting Dask, every rank checks that Slurm gave it what the plan
 requested: the node count, CPUs per task and its actual CPU affinity, and memory
-per node. Ranks other than zero wait up to 120 seconds for the scheduler, which
+per node. GPU allocations also validate Slurm's native GPU count.
+Ranks other than zero wait up to 120 seconds for the scheduler, which
 has as long to start. A failed check or timeout logs
 `Slurm Dask startup failed: …` to the submission log and exits nonzero. Look
 there when a job is active but never becomes ready.
+
+## GPU allocations
+
+GPU support uses NVIDIA CUDA devices on Linux. `lc compute resources` shows
+configured accelerator types and counts; Lightcone does not probe CUDA or discover
+local hardware. There is no fractional GPU or MIG management.
+
+Requests use SkyPilot-style `NAME[:COUNT]`: `--gpus A100` means one A100,
+`--gpus A100:4` means exactly four, and `--gpus GPU:4` accepts any configured model
+with exactly four. Names are case-insensitive catalog labels; GPU counts do not
+accept `+`. Omitting `--gpus`, or passing `0`, selects CPU-only offers.
+
+For local GPUs, add an offer to the [workstation catalog above](#customize-resource-offers):
+
+```yaml
+  - name: workstation-gpu
+    connection: workstation
+    resources: {cpus: 4, memory: 8GB, accelerators: 'GPU:1'}
+    max_nodes: 1
+    time: {default: 30m, max: 2h}
+    startup: fast
+```
+
+Set the devices available to that allocation when launching it:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 lc compute launch --cpus 4 --memory 8GB --gpus GPU:1
+```
+
+Lightcone freezes the nonempty mask and `CUDA_DEVICE_ORDER`, if set, at launch.
+You are responsible for matching the catalog's count and model to those devices;
+Lightcone does not verify them. Local allocations do not reserve GPUs exclusively
+against other allocations or programs on the host. Before launch, the host must
+have loaded the NVIDIA driver and created its character devices, including UVM.
+Lightcone grants existing device nodes and does not initialize them; see
+[NVIDIA's device setup utility](https://github.com/NVIDIA/nvidia-modprobe/blob/main/nvidia-modprobe.1.m4).
+
+On Slurm, the offer's `config.gpu_type` maps its catalog label to a native GRES
+type. For example, add this offer with settings adjusted to your site:
+
+```yaml
+- name: gpu-batch
+  connection: perlmutter
+  resources: {cpus: 32, memory: 128GB, accelerators: 'A100:4'}
+  max_nodes: 2
+  time: {default: 1h, max: 4h}
+  startup: batch
+  config:
+    account: myproject
+    constraint: gpu
+    gpu_type: a100
+```
+
+```bash
+lc compute launch --cpus 32 --memory 128GB --gpus A100:4 --dry-run
+```
+
+This is an illustrative shape, not a tested site configuration. Slurm allocates
+GPUs through GRES; Lightcone checks the native count and passes Slurm's CUDA mask
+through unchanged, using `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
+
+GPU commands inherit the allocation's whole CUDA mask. CPU commands receive an
+empty mask. These are cooperative visibility settings; native OS and cgroup
+permissions remain authoritative.
+
+Containerized GPU execution currently supports **podman-hpc** through its native
+`--gpu` option. See [NERSC's GPU container guidance](https://docs.nersc.gov/development/containers/podman-hpc/overview/#using-nvidia-gpus-in-podman-hpc).
+Recipes explicitly requesting GPUs with ordinary Docker or Podman are refused
+before image preparation. `lc run` probes on those runtimes remain usable on a
+GPU cluster: they run without GPUs and report that limitation. CPU execution
+supports all three runtimes and sets `NVIDIA_VISIBLE_DEVICES=void` to override
+GPU-enabled image defaults. Physical GPU execution remains a deployment
+validation step.
+
+A standalone GPU rerun needs a device mask in its own environment, for example
+`CUDA_VISIBLE_DEVICES=0 datalad rerun`. It does not inherit an old allocation's
+mask or reserve devices through Dask.
+
+## Recipe resource requirements
+
+Declare each recipe's needs in `astra.yaml`:
+
+```yaml
+recipe:
+  command: python src/fit.py {output}
+  resources:
+    cpus: 4
+    memory: 8Gi
+    gpus: 1
+```
+
+Each recipe runs on one worker. Its CPU, memory, and GPU request must fit that
+worker, even when the cluster has several nodes. Dask reserves CPU and memory
+while the task runs, so recipes can run together only when their combined
+requests fit. `task_slots_per_node` also caps concurrent tasks; it does not
+limit how many CPUs a single recipe may request.
+
+CPUs must be positive whole numbers and default to one. Memory needs units:
+`512Mi` and `8Gi` are binary sizes; `8GB` is decimal, unlike compute memory.
+Bare quantities are not accepted. Without a memory declaration, no RAM is
+reserved: CPU requests and `task_slots_per_node` control concurrency.
+
+Recipe `gpus` is a nonnegative whole count, defaulting to zero; accelerator type
+selection belongs to cluster allocation. A GPU recipe reserves the worker's
+entire GPU budget, so only one GPU recipe runs on that worker at a time. The
+requested count is a minimum capacity requirement: the command inherits the
+worker's whole allocated CUDA mask and may see more GPUs than requested. CPU
+recipes may still run alongside it when CPU, memory, and task slots permit; their
+CUDA mask is empty. `lc run` reserves the worker's entire CPU, memory, and GPU
+budgets; direct and podman-hpc probes inherit that allocation mask.
+
+Recipe `time_limit` is not supported and is refused before preparation or
+execution. Set the allocation lifetime with `lc compute launch --time` instead.
+Fractional CPU/GPU counts, GPU model requests inside a recipe, and disk requests
+are also rejected rather than ignored.
+
+`lc materialize` first classifies the selected graph, then checks resources for
+outputs that may rebuild before preparation or submission. Already-current or
+unrefreshed behind outputs reserve nothing. Dependents of an output that may
+change still need resources; the worker may later skip them if the actual
+upstream digest is unchanged. Use `lc materialize --check` to inspect currency
+without allocation. Read-only `status` and `--check` accept valid ASTRA resource
+declarations even when this executor cannot satisfy them.
+
+These are scheduling reservations, not per-recipe CPU or RAM enforcement.
+Recipes must respect their declarations; a subprocess can otherwise exceed
+its request. Slurm enforces the overall allocation, while local execution
+uses cooperative budgets. Leave capacity for the scheduler, workers, and other
+overhead when declaring recipe requirements.
+
+A CPU reservation does not set numerical-library thread counts. Local clusters
+use Dask's Nanny defaults of `1` for `OMP_NUM_THREADS`, `MKL_NUM_THREADS`, and
+`OPENBLAS_NUM_THREADS` when those variables are unset. Set the variables before
+`lc compute launch`, or in the recipe command, to choose another value. See
+[Dask's defaults](https://docs.dask.org/en/stable/configuration.html#distributed.nanny.pre-spawn-environ.OMP_NUM_THREADS)
+and [environment precedence](https://distributed.dask.org/en/stable/_modules/distributed/nanny.html).
+Slurm workers run directly without a Nanny and inherit the job's thread settings.
 
 ## Execution requirements and limits
 

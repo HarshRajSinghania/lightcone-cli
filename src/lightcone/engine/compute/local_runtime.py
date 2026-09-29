@@ -54,6 +54,10 @@ def main() -> None:
         from distributed import LocalCluster
 
         security = create_security(directory)
+        allocation = read_private_json(directory / "identity.json")
+        gpus = int(allocation.get("gpus", 0))
+        if not gpus:
+            os.environ["CUDA_VISIBLE_DEVICES"] = ""
         with dask.config.set(SCHEDULER_CONFIG), LocalCluster(  # type: ignore[no-untyped-call]
             n_workers=1,
             threads_per_worker=int(launch["task_slots"]),
@@ -73,6 +77,9 @@ def main() -> None:
             # Recipes use subprocesses: Dask's Python-process RSS cannot enforce
             # their RAM envelope. Local resource limits are explicitly cooperative.
             memory_limit=0,
+            resources={
+                "CPU": int(allocation["cpus"]), "MEMORY": int(allocation["memory"]), "GPU": gpus,
+            },
             silence_logs=50,
         ) as cluster:
             write_private_json(

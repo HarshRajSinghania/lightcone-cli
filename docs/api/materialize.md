@@ -18,16 +18,20 @@ driver's stderr, independently of success or failure, leaving stdout for the rep
 | `check(root, targets, *, refresh)` | The same classification without executing, committing, or fetching. Exempt from the dirty refusal. |
 | `status(root)` | The report: every output's state and provenance commit, plus the mode/image/sandbox header facts. |
 | `MaterializeReport` / `StatusReport` | The JSON surfaces; `ok` and `up_to_date` first. |
-| `cluster_for_run(cluster_id)` | Borrow the cluster; the submit/completed scheduler seam (`submit`, `completed`). |
+| `cluster_for_run(cluster_id)` | Borrow the cluster; expose resource validation, submission, and completion. |
 | `run_record(...)` / `datalad_run_subject(...)` | The commit message `datalad rerun` replays, and the one spelling of its subject line — shared with the foreign-write comparator, because two strings here would drift. |
 | `_engine_requirement()` | How a record pins its engine: by version for a release, by source commit (hatch-vcs) for a dev build. |
 
 ## The run's order, and why
 
 1. **Read-only project checks before connecting** — tool, committer, dirty-tree,
-   spec and lock errors do not require a reachable cluster to report.
+   spec and lock errors do not require a reachable cluster to report. The shared
+   classification walk identifies outputs already current or left behind.
 2. **Explicit cluster before preparing the environment** — validate native
-   allocation identity and connect before fetching inputs or building an image.
+   allocation identity, connect, and validate CPU/memory/GPU requests for tasks
+   that may execute. Known skips become values without resource reservations;
+   dependents of potentially rebuilt outputs still need admission. Explicit GPU
+   recipes must also have a supported runtime before any image build.
    The dirty refusal has already run: in
    containerized mode the converge can commit an image archive, and
    `dataset.save` commits the whole index; on a dirty tree the user's

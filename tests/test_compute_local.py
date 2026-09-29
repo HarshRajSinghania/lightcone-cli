@@ -15,11 +15,14 @@ import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 import psutil
 import pytest
 
+from lightcone.engine.compute import Compute, local, local_runtime
+from lightcone.engine.compute.catalog import Catalog
 from lightcone.engine.compute.local import LocalProvider
 from lightcone.engine.compute.model import (
     ComputeError,
@@ -221,6 +224,51 @@ with connect(sys.argv[2]) as client:
         Compute().down(identity.encode())
     assert Compute().status(identity.encode()).phase == "ended"
     assert Compute().discover() == ([], {})
+
+
+def test_cpu_allocation_without_gpu_fields_remains_discoverable_and_stoppable(
+    provider: LocalProvider,
+) -> None:
+    identity = _launch(provider)
+    try:
+        _ready(provider, identity)
+        path = provider.root / identity.token / "identity.json"
+        record = read_private_json(path)
+        del record["gpus"], record["accelerator_name"]
+        write_private_json(path, record)
+
+        snapshot, = provider.discover()
+        assert snapshot.identity == identity
+        assert snapshot.resources is not None
+        assert snapshot.resources.gpus == 0
+        assert snapshot.resources.accelerator_name is None
+        with provider.connect(identity) as client:
+            assert client.submit(sum, [1, 2]).result(timeout=5) == 3
+    finally:
+        provider.terminate(identity)
+    _ended(provider, identity)
+
+
+@pytest.mark.parametrize("threads", [None, "2"])
+def test_local_workers_keep_native_dask_thread_defaults_and_launch_overrides(
+    provider: LocalProvider, monkeypatch: pytest.MonkeyPatch, threads: str | None,
+) -> None:
+    names = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS")
+    for name in names:
+        if threads is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, threads)
+    identity = _launch(provider)
+    try:
+        _ready(provider, identity)
+        with provider.connect(identity) as client:
+            actual = client.submit(lambda: {name: os.environ.get(name) for name in names}).result(
+                timeout=5,
+            )
+        assert actual == dict.fromkeys(names, threads or "1")
+    finally:
+        provider.terminate(identity)
 
 
 def test_named_local_allocation_is_discovered_and_name_can_be_reused_after_down(
@@ -807,3 +855,148 @@ def test_local_plan_does_not_infer_policy_from_login_hostname_or_slurm_environme
     plan = provider.plan(offer, Request(cpus=1, memory_bytes=512 * 1024**2))
     assert plan.resources == offer.resources
     assert not provider.root.exists()
+
+
+@pytest.mark.parametrize("gpus", [0, 1])
+@pytest.mark.parametrize("order", [None, "PCI_BUS_ID", "FASTEST_FIRST"])
+def test_local_gpu_plan_freezes_native_mask_and_publishes_the_configured_envelope(
+    provider: LocalProvider, monkeypatch: pytest.MonkeyPatch, gpus: int,
+    order: str | None,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    # Mask interpretation and agreement with the catalog belong to the operator.
+    mask = "GPU-opaque,3"
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", mask)
+    if order is None:
+        monkeypatch.delenv("CUDA_DEVICE_ORDER", raising=False)
+    else:
+        monkeypatch.setenv("CUDA_DEVICE_ORDER", order)
+    probe = MagicMock(side_effect=AssertionError("local GPU planning must not probe hardware"))
+    monkeypatch.setattr(local.subprocess, "run", probe)
+    offer = Offer(
+        name="gpu", connection="workstation",
+        resources=Resources.from_bytes(
+            cpus=1, memory_bytes=512 * 1024**2, gpus=gpus, accelerator_name="A100",
+        ),
+        max_nodes=1, time=TimeLimits(default="1m", max="1m"),
+    )
+    plan = provider.plan(offer, Request.parse("1", "0.5", gpus=f"GPU:{gpus}" if gpus else "0"))
+    assert plan.details["cuda_visible_devices"] == (mask if gpus else "")
+    assert plan.details["cuda_device_order"] == order
+    assert not provider.root.exists()
+    monkeypatch.setattr(local, "_boot_identity", lambda: str(uuid4()))
+    popen = MagicMock(return_value=SimpleNamespace(pid=12345))
+    monkeypatch.setattr(local.subprocess, "Popen", popen)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "an-ambient-mask")
+    monkeypatch.setenv("CUDA_DEVICE_ORDER", "changed-after-planning")
+
+    identity = provider.launch(plan)
+
+    assert popen.call_args.kwargs["env"]["CUDA_VISIBLE_DEVICES"] == (mask if gpus else "")
+    assert popen.call_args.kwargs["env"].get("CUDA_DEVICE_ORDER") == order
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "an-ambient-mask"
+    assert os.environ["CUDA_DEVICE_ORDER"] == "changed-after-planning"
+    record = read_private_json(provider.root / identity.token / "identity.json")
+    assert record["gpus"] == gpus
+    monkeypatch.setattr(provider, "_process", lambda *_: None)
+    snapshot = provider.inspect(identity)
+    assert snapshot.resources is not None and snapshot.resources.gpus == gpus
+    assert snapshot.resources.accelerator_name == ("A100" if gpus else None)
+    probe.assert_not_called()
+
+
+@pytest.mark.parametrize("mask", [None, ""])
+def test_local_gpu_offers_require_an_explicit_nonempty_native_mask(
+    provider: LocalProvider, monkeypatch: pytest.MonkeyPatch,
+    mask: str | None,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "linux")
+    if mask is None:
+        monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    else:
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", mask)
+    offer = Offer(
+        name="gpu", connection="workstation",
+        resources=Resources.from_bytes(cpus=1, memory_bytes=512 * 1024**2, gpus=1),
+        max_nodes=1, time=TimeLimits(default="1m", max="1m"),
+    )
+    request = Request.parse("1", "0.5", gpus="GPU:1")
+    with pytest.raises(ComputeError, match="nonempty CUDA_VISIBLE_DEVICES"):
+        provider.plan(offer, request)
+    assert not provider.root.exists()
+
+
+def test_unconfigured_local_gpu_mask_does_not_hide_a_later_slurm_offer(
+    provider: LocalProvider, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    local_offer = Offer(
+        name="local-gpu", connection="workstation",
+        resources=Resources.from_bytes(cpus=1, memory_bytes=512 * 1024**2, gpus=1),
+        max_nodes=1, time=TimeLimits(default="1m", max="1m"),
+    )
+    service = Compute.__new__(Compute)
+    service.catalog = Catalog(
+        version=1,
+        connections={
+            "workstation": provider.connection,
+            "hpc": Connection(namespace=str(uuid4()), provider="slurm"),
+        },
+        offers=[local_offer, local_offer.replace(name="batch-gpu", connection="hpc")],
+    )
+    plan = service.plan(Request.parse("1", "0.5", gpus="GPU:1"))
+    assert plan.offer.name == "batch-gpu"
+    assert not provider.root.exists()
+
+
+def test_local_gpu_offers_are_unavailable_outside_linux(
+    provider: LocalProvider, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    offer = Offer(
+        name="gpu", connection="workstation",
+        resources=Resources.from_bytes(
+            cpus=1, memory_bytes=512 * 1024**2, gpus=1,
+        ),
+        max_nodes=1, time=TimeLimits(default="1m", max="1m"),
+    )
+    with pytest.raises(ComputeError, match="GPU allocations require Linux"):
+        provider.plan(offer, Request.parse("1", "0.5", gpus="GPU:1"))
+
+
+@pytest.mark.parametrize("gpus", [None, 0, 2])
+def test_local_runtime_advertises_configured_resources_and_preserves_native_gpu_mask(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gpus: int | None,
+) -> None:
+    import distributed
+
+    directory = private_directory(tmp_path / "allocation", create=True)
+    scratch = private_directory(tmp_path / "scratch", create=True)
+    write_private_json(directory / "launch.json", {
+        "identity": "allocation", "deadline": time.monotonic() + 60,
+        "task_slots": 1, "scratch": str(scratch),
+    })
+    record = {"cpus": 1, "memory": 1024**3}
+    if gpus is not None:
+        record["gpus"] = gpus
+    write_private_json(directory / "identity.json", record)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3,1")
+    monkeypatch.setattr(sys, "argv", ["local_runtime", str(directory)])
+    monkeypatch.setattr(os, "getsid", lambda _: os.getpid())
+    monkeypatch.setattr(os, "getpgrp", os.getpid)
+    monkeypatch.setattr(os, "umask", lambda _: 0)
+    monkeypatch.setattr(local_runtime.atexit, "register", lambda *_: None)
+    monkeypatch.setattr(signal, "setitimer", lambda *_: None)
+    monkeypatch.setattr(
+        signal, "signal", lambda signum, handler: handler(signum, None)
+        if signum == signal.SIGTERM else None,
+    )
+    monkeypatch.setattr(local_runtime, "create_security", lambda _: None)
+    cluster = MagicMock()
+    cluster.return_value.__enter__.return_value.scheduler.id = "Scheduler-gpu"
+    monkeypatch.setattr(distributed, "LocalCluster", cluster)
+
+    local_runtime.main()
+    assert cluster.call_args.kwargs["resources"] == {"CPU": 1, "MEMORY": 1024**3, "GPU": gpus or 0}
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == ("3,1" if gpus else "")

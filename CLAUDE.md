@@ -952,10 +952,10 @@ none; formats may, `tar.gz`), never `Path.stem`. The old
 `_HASH_EXCLUDE` is gone with the directory that made it necessary: the
 manifest cannot be inside the thing it describes any more.
 
-**Dask owns the ordering.** Every task is submitted with its upstream
-futures as arguments, so the dependency order, the parallelism, and the
-scheduling all fall out of the argument graph. There is no ready-set loop
-and no hand-rolled topological sort in the execution path.
+**Dask owns the ordering.** Tasks that may execute receive upstream futures
+or already-current `TaskResult` values as arguments, so dependency order,
+parallelism, and scheduling fall out of the argument graph. There is no ready-set
+loop and no hand-rolled topological sort in the execution path.
 `Graph.order()` exists for the read-only walk, which has to classify a
 task after everything upstream of it — and for submitting in an order
 where a task's upstream handles already exist.
@@ -1165,7 +1165,7 @@ its sync touches only ignored paths — so both modes run one order.)
 
 **A run fetches its declared inputs; the read-only verbs never do.**
 `materialize` batch-runs `git annex get` over the graph's in-tree
-declared inputs before anything hashes (driver-side — the storage
+declared inputs before workers hash or execute (driver-side — the storage
 invariant that nobody is ever asked to run an annex command by hand),
 so a bytes-free clone materializes straight to up-to-date. A failed
 fetch is a *warning*, never a refusal: independent tasks still run and
@@ -1727,6 +1727,10 @@ and use it for every native ownership check and filter.
 **Local compute needs no setup.** An absent implicit `~/.lightcone/compute.yaml`
 selects a built-in local catalog: one CPU, 1 GiB, one node, fast startup, 30-minute
 default and two-hour maximum lifetime. It writes no catalog and starts no cluster.
+GPU offers require an explicit catalog and, for local launches, a nonempty
+`CUDA_VISIBLE_DEVICES` mask on Linux. No GPU auto-discovery. Local GPU capacity and
+model labels are configured, not hardware-verified; allocations do not reserve
+devices exclusively against other host programs or allocations.
 Configured catalogs replace it completely; missing explicit paths and invalid
 files are errors. Execution still requires an explicitly launched cluster's name or ID.
 
@@ -1753,6 +1757,17 @@ Connection names live only in the catalog's mapping keys. Use validated `replace
 for updates and the explicit `as_dict` allowlists for public output. Preserve
 duplicate-key rejection in YAML; providers validate their own `launch` and `config`.
 
+**Allocation syntax follows SkyPilot without depending on SkyPilot.** Compute
+CPU/memory requests support exact quantities or `+` minimums. Compute memory
+uses binary units: bare `32`, `32GB`, and `32GiB` agree. Catalog resources use
+one `accelerators: NAME[:COUNT]` or a one-entry mapping; CLI `--gpus A100:4`,
+`A100`, or generic `GPU:4` selects an exact positive whole count, while `0`
+means CPU only. Type matching is case-insensitive; no GPU `+`, fractions, or
+global model alias registry. Local accelerator labels are trusted configuration.
+Named Slurm offers must map their public label to the site's GRES type through
+`config.gpu_type`; generic `GPU` offers may omit that setting. Preserve native
+evidence in observations.
+
 **Configured compute roots may be filesystem aliases.** Resolve connection and
 scratch roots before appending managed namespace, submission, or attempt paths.
 Keep symlink rejection within those managed paths and enforce private directory
@@ -1778,6 +1793,47 @@ input-hash memo on the driver before serializing it to independent worker tasks.
 Any driver failure while tasks are outstanding (a failed commit included, not
 only a cluster error) carries `compute.UNSTOPPED`, the one wording for "the
 allocation was not stopped and unreported tasks may still be running".
+
+**Recipe resources use standard Dask admission.** Preserve ASTRA `recipe.resources`
+in `plan.Task` as raw mappings so `status` and `--check` remain independent of
+executor support. Parse `TaskResources` at execution admission: whole CPUs, memory
+bytes, and whole GPU counts. Reuse the read-only classification walk before
+admission: known current/behind outputs become values without Dask submission.
+Validate tasks that may execute, including dependents of potentially rebuilt
+outputs; workers recheck actual upstream digests. Normalize worker budgets once
+with `worker_capacities`, then pass reservations explicitly to submission. Recipe
+`time_limit` is unsupported and must fail explicitly; allocation walltime remains supported.
+Workers advertise CPU/MEMORY/GPU; tasks reserve their declarations. Omitted RAM
+adds no memory reservation; CPU requests and task slots govern concurrency.
+Probes reserve all whole-worker budgets.
+GPU recipes reserve the worker's full GPU budget, one GPU recipe at a time, and
+inherit its whole allocation mask. Recipe `gpus` is a minimum capacity requirement,
+not a visibility limit; it defaults to zero and does not select a model. Recipe
+memory retains ASTRA units (`8Gi` binary, `8GB` decimal, no bare quantities),
+independently of compute's SkyPilot units.
+Thread slots remain a separate concurrency cap. Reservations are cooperative, not
+per-command OS CPU/RAM limits or BLAS thread counts. Local Nanny defaults keep
+OMP/MKL/OPENBLAS threads at one unless the launch environment overrides them; Slurm
+uses direct workers and the job environment. Unsupported disk/model requests and
+fractional CPU/GPU counts fail explicitly. Exact bytes are shared in `units.py`;
+allocation durations are parsed in `compute.model`, with error conversion only
+at the CLI request boundary.
+
+**GPU visibility comes from the allocation, not device discovery.** No CUDA probe,
+UUID inventory, MIG detection, model verification, or custom Dask worker. Local
+launch freezes the externally supplied nonempty CUDA mask and optional device
+order. Slurm validates native GPU counts, preserves its mask, and sets
+`CUDA_DEVICE_ORDER=PCI_BUS_ID`. `exec_policy(use_gpus=True)` inherits that whole
+mask; CPU commands get an empty one. Never mutate the reusable worker's environment.
+Direct GPU policies grant native NVIDIA character nodes; OS permissions and cgroups
+remain authoritative. The host must initialize NVIDIA character devices including
+UVM before launch; lc neither loads drivers nor creates nodes. Standalone GPU
+reruns need an explicit CUDA mask in their own environment. Container GPU execution
+supports podman-hpc `--gpu` only. Explicit GPU recipes on ordinary Docker/Podman
+fail before image preparation; probes use CPU policy with a diagnostic note while
+retaining their whole-worker reservation. CPU containers remain supported on all
+runtimes and set `NVIDIA_VISIBLE_DEVICES=void`. Physical GPU execution remains
+unvalidated; tests check real subprocess masks and native argv without GPU hardware.
 
 **One catalog selector, `LC_COMPUTE_CONFIG` (2026-09).** `lc compute --config`
 was removed: `run` and `materialize` resolve clusters through the catalog too,

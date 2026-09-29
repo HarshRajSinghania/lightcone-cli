@@ -471,7 +471,9 @@ def test_shared_inputs_are_hashed_once_before_task_serialization(
         return real(path)
 
     class _Copied(_Inline):
-        def submit(self, fn: Callable[..., object], *args: object, key: str) -> object:
+        def submit(
+            self, fn: Callable[..., object], *args: object, key: str, resources: dict[str, float],
+        ) -> object:
             return fn(*pickle.loads(pickle.dumps(args)))
 
     monkeypatch.setattr(assets, "data_version", digest)
@@ -1060,6 +1062,200 @@ def test_the_recorded_command_holds_on_a_fresh_clone(
 # ---- the scheduler seam ----------------------------------------------------
 
 
+def _resource_cluster(
+    monkeypatch: pytest.MonkeyPatch, *, workers: int = 1, gpus: int = 0,
+) -> None:
+    from distributed import Client, LocalCluster
+
+    from lightcone.engine import compute
+
+    @contextmanager
+    def connect(cluster_id: str) -> Iterator[Any]:
+        with LocalCluster(
+            n_workers=workers, threads_per_worker=4, processes=False,
+            dashboard_address=None, resources={"CPU": 4, "MEMORY": 2 * 1024**3, "GPU": gpus},
+        ) as cluster, Client(cluster, set_as_default=False) as client:
+            yield client
+
+    monkeypatch.setattr(compute, "connect", connect)
+
+
+@pytest.mark.parametrize("resource_spec", ["cpus: 5", "memory: 3Gi"])
+def test_resource_refusal_precedes_preparation_and_all_recipes(
+    analysis: Callable[..., Path], monkeypatch: pytest.MonkeyPatch, resource_spec: str,
+) -> None:
+    spec = _SPEC.replace(
+        "command: cat", f"resources: {{{resource_spec}}}\n      command: cat"
+    )
+    root = analysis(spec, universes={"baseline": _UNIVERSE})
+    before = dataset.head(root)
+    _resource_cluster(monkeypatch)
+
+    def unexpected(*args: object, **kwargs: object) -> None:
+        pytest.fail("preparation began before all resource requests were validated")
+
+    monkeypatch.setattr(engine, "_fetch_inputs", unexpected)
+    monkeypatch.setattr(engine.container, "runtime_for_run", unexpected)
+    with pytest.raises(ProjectError, match="baseline/second:.*no worker"):
+        engine.materialize(root, [], cluster_id=CLUSTER_ID)
+    assert dataset.head(root) == before
+    assert not dataset.status(root)
+    assert not (root / "results/baseline/first.txt").exists()
+
+
+@pytest.mark.parametrize("resource_spec", [
+    "gpus: 1", "disk: 1Gi", "cpus: 0.5", "cpus: 0", "memory: null", "time_limit: 1s",
+])
+def test_execution_only_resources_do_not_block_read_only_commands(
+    analysis: Callable[..., Path], monkeypatch: pytest.MonkeyPatch, resource_spec: str,
+) -> None:
+    spec = _SPEC.replace(
+        "command: cat", f"resources: {{{resource_spec}}}\n      command: cat",
+    )
+    root = analysis(spec, universes={"baseline": _UNIVERSE})
+    assert len(engine.status(root).outputs) == 2
+    assert set(engine.check(root, []).planned) == {"baseline/first", "baseline/second"}
+
+    _resource_cluster(monkeypatch)
+
+    def unexpected(*args: object, **kwargs: object) -> None:
+        pytest.fail("preparation began before execution requirements were validated")
+
+    monkeypatch.setattr(engine, "_fetch_inputs", unexpected)
+    with pytest.raises(ProjectError, match="baseline/second"):
+        engine.materialize(root, [], cluster_id=CLUSTER_ID)
+    assert not dataset.status(root)
+
+
+
+@pytest.mark.parametrize("runtime_name", ["docker", "podman"])
+def test_gpu_runtime_refusal_precedes_image_build_and_all_recipes(
+    analysis: Callable[..., Path], monkeypatch: pytest.MonkeyPatch, runtime_name: str,
+) -> None:
+    spec = _SPEC.replace("command: cat", "resources: {gpus: 1}\n      command: cat")
+    root = analysis(spec, universes={"baseline": _UNIVERSE})
+    _resource_cluster(monkeypatch, gpus=1)
+    pyproject = root / "pyproject.toml"
+    pyproject.write_text(pyproject.read_text() + "\n[tool.lightcone.image]\napt-install = []\n")
+    dataset.save(root, [pyproject], "declare a container image")
+    monkeypatch.setattr(engine.container, "runtime_name", lambda _: runtime_name)
+
+    def unexpected(*args: object, **kwargs: object) -> None:
+        pytest.fail("image preparation began for an unsupported GPU runtime")
+
+    monkeypatch.setattr(engine.container.image, "tag", unexpected)
+    before = dataset.head(root)
+    with pytest.raises(ProjectError, match="GPU containers require podman-hpc"):
+        engine.materialize(root, [], cluster_id=CLUSTER_ID)
+    assert dataset.head(root) == before
+    assert not dataset.status(root)
+    assert not (root / "results/baseline/first.txt").exists()
+
+def test_empty_cluster_refuses_before_project_preparation(
+    root: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _resource_cluster(monkeypatch, workers=0)
+
+    def unexpected(*args: object, **kwargs: object) -> None:
+        pytest.fail("preparation began without an available worker")
+
+    monkeypatch.setattr(engine, "_fetch_inputs", unexpected)
+    with pytest.raises(ProjectError, match="no workers"):
+        engine.materialize(root, [], cluster_id=CLUSTER_ID)
+    assert not dataset.status(root)
+
+
+@pytest.mark.parametrize(
+    ("resource_spec", "gpus", "expected_parallelism"),
+    [
+        ("", 0, 4),
+        ("cpus: 3, memory: 256Mi", 0, 1),
+        ("cpus: 1, memory: 1Gi", 0, 2),
+        ("cpus: 1, memory: 256Mi, gpus: 1", 2, 1),
+    ],
+)
+def test_real_dask_respects_recipe_resource_reservations(
+    analysis: Callable[..., Path], monkeypatch: pytest.MonkeyPatch,
+    resource_spec: str, gpus: int, expected_parallelism: int,
+) -> None:
+    # Four Dask threads would run all four subprocesses together without
+    # resource reservations. Each independent output records its live interval.
+    spec = 'version: "0.0.13"\nname: analysis\ninputs: []\noutputs:\n' + "".join(
+        f"  - id: task{index}\n"
+        "    type: metric\n"
+        "    format: json\n"
+        "    recipe:\n"
+        f"      resources: {{{resource_spec}}}\n"
+        "      command: python src/work.py {output}\n"
+        for index in range(4)
+    )
+    root = analysis(spec, files={"src/work.py": """
+        import json
+        import os
+        import sys
+        import time
+        from pathlib import Path
+        start = time.monotonic()
+        time.sleep(0.5)
+        Path(sys.argv[1]).write_text(json.dumps([
+            start, time.monotonic(), os.environ.get("CUDA_VISIBLE_DEVICES"),
+        ]))
+    """})
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,0")
+    _resource_cluster(monkeypatch, gpus=gpus)
+
+    report = engine.materialize(root, [], cluster_id=CLUSTER_ID)
+
+    assert report.ok and len(report.made) == 4
+    events = []
+    for path in (root / "results/baseline").glob("task*.json"):
+        start, finish, visible = json.loads(path.read_text())
+        assert visible == ("2,0" if gpus else "")
+        events.extend([(start, 1), (finish, -1)])
+    live = peak = 0
+    for _, change in sorted(events):
+        live += change
+        peak = max(peak, live)
+    assert peak == expected_parallelism
+    assert not dataset.status(root)
+
+
+
+def test_current_gpu_output_needs_no_gpu_to_build_a_cpu_dependent(
+    analysis: Callable[..., Path], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _SPEC.replace("command: echo", "resources: {gpus: 1}\n      command: echo")
+    root = analysis(spec, universes={"baseline": _UNIVERSE})
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    _resource_cluster(monkeypatch, gpus=1)
+    assert engine.materialize(root, ["first"], cluster_id=CLUSTER_ID).made == ["baseline/first"]
+    original = (root / "results/baseline/.first.manifest.json").read_bytes()
+
+    _resource_cluster(monkeypatch)
+    report = engine.materialize(root, [], cluster_id=CLUSTER_ID)
+    assert report.ok
+    assert report.current == ["baseline/first"]
+    assert report.made == ["baseline/second"]
+    assert (root / "results/baseline/.first.manifest.json").read_bytes() == original
+    assert not dataset.status(root)
+
+
+def test_current_outputs_are_not_submitted_to_dask(
+    root: Path, inline: None, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine.materialize(root, [], cluster_id=CLUSTER_ID)
+
+    class NoExecution(_Inline):
+        def validate(self, tasks: Any) -> dict[Any, Any]:
+            assert not list(tasks)
+            return {}
+
+        def submit(self, *args: Any, **kwargs: Any) -> Any:
+            pytest.fail("a current output was submitted to Dask")
+
+    _cluster(monkeypatch, NoExecution())
+    assert len(engine.materialize(root, [], cluster_id=CLUSTER_ID).current) == 2
+
 def test_a_real_cluster_still_fits_through_the_seam(root: Path, cluster_id: str) -> None:
     """The one test that starts Dask. The seam is only worth having if the
     thing it abstracts still goes through it."""
@@ -1084,7 +1280,8 @@ def test_a_processes_cluster_fits_through_the_seam(
     @contextmanager
     def processes(cluster_id: str) -> Iterator[Any]:
         with LocalCluster(
-            n_workers=2, threads_per_worker=1, processes=True, dashboard_address=None
+            n_workers=2, threads_per_worker=1, processes=True, dashboard_address=None,
+            resources={"CPU": 1, "MEMORY": 1024**3},
         ) as cluster:
             with Client(cluster, set_as_default=False) as client:
                 yield client

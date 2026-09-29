@@ -104,6 +104,15 @@ class LocalProvider:
 
         if offer.resources.cpus > CPU_COUNT or offer.resources.memory_bytes > MEMORY_LIMIT:
             raise UnavailableOfferError("the local offer exceeds this host's CPU or RAM capacity")
+        mask = ""
+        if offer.resources.gpus:
+            if sys.platform != "linux":
+                raise UnavailableOfferError("local GPU allocations require Linux")
+            mask = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            if not mask:
+                raise UnavailableOfferError(
+                    "local GPU offers require an explicit nonempty CUDA_VISIBLE_DEVICES mask"
+                )
         seconds = request.seconds if request.seconds is not None else offer.time.default_seconds
         if seconds <= 0 or seconds > offer.time.max_seconds:
             raise ComputeError("local allocations require a finite time within the offer's limit")
@@ -123,7 +132,9 @@ class LocalProvider:
                 "connection_root": str(self.root),
                 "scratch_root": str(scratch),
                 "task_slots_per_node": slots,
-                "resource_enforcement": "cooperative; no exclusive CPU or RAM reservation",
+                "cuda_visible_devices": mask,
+                "cuda_device_order": os.environ.get("CUDA_DEVICE_ORDER"),
+                "resource_enforcement": "cooperative; no exclusive CPU, RAM, or GPU reservation",
                 "termination_grace_seconds": _STOP_GRACE,
             },
         )
@@ -150,6 +161,11 @@ class LocalProvider:
         )
         process: subprocess.Popen[bytes] | None = None
         identity: Identity | None = None
+        environment = {**os.environ, "CUDA_VISIBLE_DEVICES": plan.details["cuda_visible_devices"]}
+        if plan.details["cuda_device_order"] is None:
+            environment.pop("CUDA_DEVICE_ORDER", None)
+        else:
+            environment["CUDA_DEVICE_ORDER"] = plan.details["cuda_device_order"]
         try:
             # This allocation outlives a command; the ordinary run-to-completion
             # subprocess seam cannot own it. Logs are discarded rather than grow.
@@ -160,6 +176,7 @@ class LocalProvider:
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
                 close_fds=True,
+                env=environment,
             )
             identity = Identity(
                 namespace=self.connection.namespace, native_id=str(process.pid), token=token,
@@ -174,6 +191,8 @@ class LocalProvider:
                 "host": identity.host,
                 "cpus": plan.resources.cpus,
                 "memory": plan.resources.memory_bytes,
+                "gpus": plan.resources.gpus,
+                "accelerator_name": plan.resources.accelerator_name or "GPU",
             }
             write_private_json(directory / "identity.json", record)
             # The child waits for this file before publishing its TLS connection.
@@ -233,6 +252,12 @@ class LocalProvider:
             raise ComputeError("the private locator does not match this local allocation identity")
         positive_int(record.get("cpus"), "recorded local cpus")
         positive_int(record.get("memory"), "recorded local memory")
+        record.setdefault("gpus", 0)
+        record.setdefault("accelerator_name", "GPU")
+        if type(record.get("gpus")) is not int or record["gpus"] < 0:
+            raise ComputeError("recorded local gpus must be a nonnegative integer")
+        if not isinstance(record.get("accelerator_name"), str) or not record["accelerator_name"]:
+            raise ComputeError("recorded local accelerator_name must be a nonempty string")
         return directory, record
 
     def _process(
@@ -347,7 +372,7 @@ class LocalProvider:
         except psutil.NoSuchProcess:
             process = None
             native_state = "not-running"
-        reason = "CPU and RAM budgets are cooperative, not exclusive OS reservations"
+        reason = "CPU, RAM, and GPU budgets are cooperative, not exclusive OS reservations"
         if process is None and (directory / "error.json").exists():
             reason = str(read_private_json(directory / "error.json").get("error", ""))
         return Snapshot(
@@ -355,6 +380,8 @@ class LocalProvider:
             phase="active" if process is not None else "ended",
             resources=Resources.from_bytes(
                 cpus=int(record["cpus"]), memory_bytes=int(record["memory"]),
+                gpus=record["gpus"],
+                accelerator_name=record["accelerator_name"],
             ),
             num_nodes=1,
             evidence="configured",

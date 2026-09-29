@@ -48,6 +48,7 @@ def _allocation(args: argparse.Namespace) -> tuple[Identity, int, int]:
         args.num_nodes < 1
         or args.cpus < 1
         or args.memory_bytes < 1
+        or args.gpus < 0
         or args.task_slots < 1
         or values["SLURM_NTASKS"] != args.num_nodes
         or values["SLURM_JOB_NUM_NODES"] != args.num_nodes
@@ -61,6 +62,12 @@ def _allocation(args: argparse.Namespace) -> tuple[Identity, int, int]:
     memory = os.environ.get("SLURM_MEM_PER_NODE", "")
     if not memory.isdigit() or int(memory) * 1024**2 < args.memory_bytes:
         raise ComputeError("native per-node memory does not match the allocation envelope")
+    if args.gpus:
+        native_gpus = os.environ.get("SLURM_GPUS_ON_NODE", "")
+        if not native_gpus.isdigit() or int(native_gpus) < args.gpus:
+            raise ComputeError("native per-node GPUs do not match the allocation envelope")
+        if not os.environ.get("CUDA_VISIBLE_DEVICES"):
+            raise ComputeError("GPU allocations require a native CUDA_VISIBLE_DEVICES mask")
     restarts = os.environ.get("SLURM_RESTART_COUNT", "0")
     if not restarts.isdigit():
         raise ComputeError("invalid native Slurm restart count")
@@ -76,6 +83,11 @@ async def run(args: argparse.Namespace) -> None:
     from distributed import Scheduler, Worker
 
     identity, restarts, rank = _allocation(args)
+    if args.gpus:
+        # Slurm/NVML numbers devices in PCI order; CUDA's default is different.
+        os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    else:
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
     connection = Connection(
         namespace=identity.namespace, provider="slurm",
         launch={"connection_root": args.connection_root},
@@ -94,6 +106,7 @@ async def run(args: argparse.Namespace) -> None:
         "num_nodes": args.num_nodes,
         "cpus": args.cpus,
         "memory_bytes": args.memory_bytes,
+        "gpus": args.gpus,
         "task_slots": args.task_slots,
     }
     address = {"interface": args.interface} if args.interface else {"host": socket.gethostname()}
@@ -101,6 +114,7 @@ async def run(args: argparse.Namespace) -> None:
         **address,
         "nthreads": args.task_slots,
         "memory_limit": 0,
+        "resources": {"CPU": args.cpus, "MEMORY": args.memory_bytes, "GPU": args.gpus},
         "local_directory": str(scratch),
         "dashboard_address": "127.0.0.1:0",
         "dashboard": False,
@@ -159,6 +173,7 @@ def main() -> None:
         parser.add_argument(f"--{name}", required=True)
     for name in ("num-nodes", "cpus", "memory-bytes", "task-slots"):
         parser.add_argument(f"--{name}", required=True, type=int)
+    parser.add_argument("--gpus", default=0, type=int)
     parser.add_argument("--scratch-root")
     parser.add_argument("--interface")
     args = parser.parse_args()

@@ -6,7 +6,7 @@ It owns no service, registry, or saved current-cluster selection.
 
 | Symbol | Contract |
 |---|---|
-| `Request.parse(...)` | Common exact/minimum CPU and memory requests, node count, walltime, startup class. |
+| `Request.parse(...)` | Exact/minimum CPU and memory requests, exact accelerator type/count, node count, walltime, startup class. |
 | `Catalog.load(path)` | Ordered fixed shapes and stable connection namespaces; use the built-in local catalog only when the implicit default file is absent. |
 | `Compute.plan(request, *, name=None)` | Select an eligible offer and freeze its native launch settings and optional name without allocation. |
 | `Compute.launch(plan)` | Check names across native authorities, generate one if omitted, submit once, and return a self-contained `Identity`. |
@@ -17,14 +17,15 @@ It owns no service, registry, or saved current-cluster selection.
 | `Provider` | `plan`, `launch`, `discover`, `inspect`, `connect`, `terminate`. |
 
 `Catalog.load()` defaults to `~/.lightcone/compute.yaml`. When that implicit file
-is absent, the built-in catalog exposes one `local` offer: one CPU, 1 GiB, one node,
-fast startup, 30-minute default and two-hour maximum lifetime. It creates no
-configuration file or allocation. Configured catalogs replace it completely.
+is absent, the built-in catalog exposes a `local` offer: one CPU, 1 GiB, one node,
+fast startup, 30-minute default and two-hour maximum lifetime. GPU offers require
+an explicit catalog. It creates no configuration file or allocation. Configured
+catalogs replace it completely.
 Missing paths selected through an argument or `LC_COMPUTE_CONFIG`, unreadable
 files, and invalid catalogs remain errors. Stable connection namespaces let
 separate invocations discover and attach to the same local allocations.
 
-`model.py` defines the shared Pydantic models: `Connection`, `Offer`, `Resources`,
+`model.py` defines the shared Pydantic models: `Connection`, `Offer`, `Resources`, `Accelerator`,
 `TimeLimits`, `Startup`, `Request`, `Identity`, `LaunchPlan`, and `Snapshot`.
 `Catalog` validates YAML directly into these objects, which providers also use.
 Unknown common fields are rejected; schema errors identify paths such as
@@ -38,6 +39,14 @@ is `memory`), and `memory_bytes` derives an exact integer. Native observations u
 keeps the configured `default` and `max` duration strings and exposes
 `default_seconds` and `max_seconds`. `Startup.class_` corresponds to YAML `class`.
 Connection names exist only as catalog mapping keys, referenced by `Offer.connection`.
+
+Compute memory accepts bare GiB quantities and SkyPilot-style binary units:
+`32`, `32GB`, and `32GiB` agree. CPU and memory requests accept a trailing `+`.
+`Accelerator` accepts one `NAME[:COUNT]` or one-entry mapping, such as `A100:4`
+or `{A100: 4}`, and serializes to that mapping. Counts are exact positive integers;
+type matching is case-insensitive, and the generic name `GPU` accepts any model.
+No accelerator registry or model alias expansion is maintained. Slurm's
+`config.gpu_type` maps a named catalog accelerator to its native GRES type.
 
 Model constructors take keyword arguments. `replace(...)` validates updates;
 `model_dump()` and `model_validate()` support internal roundtrips without changing
@@ -113,6 +122,64 @@ Dask chooses the workers and handles dependencies; invocation-specific keys prev
 unintended reuse across commands. There is no worker-selection layer, per-worker
 preflight orchestration, source fingerprinting, or login-node guard. Driver-side
 preparation and the existing task runtime/sandbox checks remain in their owners.
+
+Workers advertise standard Dask `CPU`, `MEMORY`, and `GPU` resources; memory is measured
+in bytes. `engine.execution_resources.TaskResources` validates ASTRA's
+`recipe.resources` into whole CPUs, bytes, and a whole GPU count at
+execution admission. `plan.Task` preserves the ASTRA mapping so read-only
+classification does not impose executor restrictions. `worker_capacities(workers)`
+normalizes advertised budgets once; `requirements(capacities)` checks that one
+worker can satisfy a task and returns its `Client.submit` resource dictionary.
+Omitted memory adds no `MEMORY` reservation. `whole_worker=True` reserves CPU,
+memory, and GPUs for a probe. Recipe GPU counts default to zero; a GPU recipe
+reserves the full GPU budget of a fitting worker
+and inherits its whole allocation mask. The requested count is a minimum, not a
+visibility limit. This serializes GPU recipes per worker without device assignment.
+Unsupported disk/type requests and fractional CPU/GPU counts fail before execution.
+
+The driver reuses the read-only classification walk before admission. Known
+current or unrefreshed behind outputs become `TaskResult` values, without Dask
+submission or resource reservations. Tasks that may execute, including dependents
+of potentially rebuilt outputs, have their resource requests validated before
+preparation. Workers recheck actual upstream digests and may still skip a reserved
+task if its inputs prove unchanged. Allocation and task requests share byte
+conversion utilities; their models remain distinct because allocation selection supports minimum quantities
+and node counts. Standard Dask scheduling accounts for
+concurrent CPU, memory, and GPU reservations; Dask execution-thread counts remain a
+separate concurrency cap. Reservations do not impose hard limits on recipe
+subprocesses. Recipe `time_limit` is unsupported and explicitly refused before
+preparation or execution; allocation walltime remains supported.
+
+Recipe memory remains ASTRA-style: `8Gi` is binary, `8GB` is decimal, and units
+are required. Allocation memory follows the compute convention above; keep the
+two parsers' contracts explicit even though they share exact byte arithmetic in
+`units.py`. Allocation duration parsing stays in `compute.model.duration`, raising
+`ValueError` for Pydantic; `Request.parse` converts it to `ComputeError`.
+
+## GPU allocation and visibility
+
+Local GPU offers require Linux and an explicit nonempty `CUDA_VISIBLE_DEVICES`.
+Planning freezes that mask and optional `CUDA_DEVICE_ORDER`; launch passes them
+to the worker unchanged. Count and model are catalog declarations, not hardware
+observations. The built-in local offer remains CPU-only.
+
+Slurm requests native GPU GRES and validates `SLURM_GPUS_ON_NODE` before
+advertising the worker's GPU budget. Bootstrap preserves Slurm's CUDA mask and
+sets `CUDA_DEVICE_ORDER=PCI_BUS_ID`. There is no CUDA probe, device inventory, or
+custom Dask worker.
+
+The sandbox's `use_gpus` policy option inherits the worker's mask for GPU commands
+and supplies an empty mask for CPU commands, without modifying the reusable
+worker's environment. Direct GPU policies grant native NVIDIA character devices.
+Container GPU execution uses podman-hpc's `--gpu`. Explicit GPU recipes on ordinary
+Docker or Podman are refused before image preparation; probes use a CPU policy and
+report that GPU access is unavailable while retaining their whole-worker reservation.
+Native permissions and cgroups remain authoritative. NVIDIA devices, including UVM,
+must already exist; policy construction does not load drivers or create devices.
+See [GPU deployment requirements](../user/cluster.md#gpu-allocations).
+
+## Execution output and teardown
+
 `output.py` transports byte chunks through standard Dask events so detached
 workers' output reaches the invoking CLI. It uses the borrowed client's event
 topic, which the schedulers lc launches drop as soon as the client disconnects

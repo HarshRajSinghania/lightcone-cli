@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from decimal import Decimal, localcontext
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -18,6 +19,7 @@ from lightcone.engine import compute
 from lightcone.engine.compute.catalog import Catalog
 from lightcone.engine.compute.model import (
     GIB,
+    Accelerator,
     ComputeError,
     Connection,
     Identity,
@@ -29,6 +31,7 @@ from lightcone.engine.compute.model import (
     Startup,
     TimeLimits,
     UnavailableOfferError,
+    duration,
     memory_bytes,
     validate_name,
 )
@@ -364,6 +367,162 @@ def test_memory_conversion_does_not_round_fractional_bytes() -> None:
         memory_bytes("0.000000000931322574615478515625000000000000000001")
 
 
+@pytest.mark.parametrize("memory", ["8", "8GB", "8gb", "8192MB", "8GiB", "0.0078125TB"])
+def test_compute_memory_uses_skypilot_binary_units(memory: str) -> None:
+    assert Request.parse("1", memory + "+").memory_bytes == 8 * GIB
+    assert Request.parse("1", memory + "+").min_memory
+    assert Resources.model_validate({"cpus": 1, "memory": memory}).memory_bytes == 8 * GIB
+
+
+def test_recipe_and_compute_memory_keep_their_specification_units() -> None:
+    from lightcone.engine.execution_resources import TaskResources
+
+    assert Request.parse("1", "8GB").memory_bytes == 8 * GIB
+    assert TaskResources.parse({"memory": "8GB"}).memory_bytes == 8_000_000_000
+
+
+def test_compute_memory_rejects_unit_suffix_without_a_size_prefix() -> None:
+    with pytest.raises(ComputeError, match="memory"):
+        Request.parse("1", "1IB")
+
+
+@pytest.mark.parametrize("value", ["A100:4", {"A100": 4}])
+def test_accelerator_sky_notations_share_one_model(value: object) -> None:
+    resource = Resources.model_validate({"cpus": 1, "memory": 1, "accelerators": value})
+    assert resource.accelerators == Accelerator(name="A100", count=4)
+    assert resource.as_dict()["accelerators"] == {"A100": 4}
+
+
+@pytest.mark.parametrize("value", [{"A100": 1, "H100": 1}, ["A100:1", "H100:1"], {"A100:1"}])
+def test_accelerator_alternatives_are_not_silently_treated_as_capacity(value: object) -> None:
+    with pytest.raises(ValidationError):
+        Resources.model_validate({"cpus": 1, "memory": 1, "accelerators": value})
+
+
+@pytest.mark.parametrize("value", [{"count": 2}, {"name": 2}, "count:2", "name:2"])
+def test_accelerator_field_names_are_not_misread_as_device_types(value: object) -> None:
+    with pytest.raises(ValidationError):
+        Resources.model_validate({"cpus": 1, "memory": 1, "accelerators": value})
+
+
+@pytest.mark.parametrize("count", [-1, 0, True, 0.5, "1", None])
+def test_accelerator_envelopes_require_positive_integer_counts(count: object) -> None:
+    with pytest.raises(ValidationError):
+        Resources.model_validate({"cpus": 1, "memory": 1, "accelerators": {"A100": count}})
+    with pytest.raises(ValidationError):
+        Request.model_validate({"cpus": 1, "memory_bytes": GIB, "accelerators": {"A100": count}})
+
+
+@pytest.mark.parametrize("gpus", ["-1", "1++", "", "A100:0.5", "A100:2+"])
+def test_cli_gpu_requests_reject_invalid_accelerator_specifications(gpus: str) -> None:
+    with pytest.raises(ComputeError, match="accelerators"):
+        Request.parse("1", "1", gpus=gpus)
+
+
+def test_accelerator_types_and_counts_survive_native_and_request_roundtrips() -> None:
+    resource = Resources.from_bytes(cpus=8, memory_bytes=16 * GIB, gpus=4, accelerator_name="A100")
+    assert resource.as_dict() == {"cpus": 8, "memory": 16, "accelerators": {"A100": 4}}
+    assert Resources.model_validate_json(resource.model_dump_json(by_alias=True)) == resource
+    assert resource.replace(cpus=4).accelerators == Accelerator(name="A100", count=4)
+    request = Request.parse("8", "16", gpus="A100:2")
+    assert request.accelerators == Accelerator(name="A100", count=2)
+    assert request.as_dict()["resources"]["accelerators"] == {"A100": 2}
+    assert Request.parse("8", "16", gpus="A100").accelerators == Accelerator(name="A100", count=1)
+    assert Request.parse("8", "16").accelerators is None
+
+
+def test_numeric_native_accelerator_names_remain_types() -> None:
+    resource = Resources.from_bytes(cpus=1, memory_bytes=GIB, gpus=2, accelerator_name="4090")
+    request = Request.parse("1", "1", gpus="4090:2")
+    assert request.accelerators is not None
+    assert request.accelerators.matches(resource.accelerators)
+    assert Request.parse("1", "1", gpus="4090").accelerators == Accelerator(name="4090", count=1)
+
+
+def test_accelerator_selection_honors_type_and_exact_count(
+    catalog: Path, provider: MagicMock,
+) -> None:
+    data = yaml.safe_load(catalog.read_text())
+    cpu = data["offers"][0]
+    data["offers"].insert(0, {
+        **cpu, "name": "gpu", "resources": {**cpu["resources"], "accelerators": "A100:4"},
+    })
+    catalog.write_text(yaml.safe_dump(data))
+    service = compute.Compute()
+    assert service.plan(Request.parse("4", "8")).offer.name == "quick"
+    assert service.plan(Request.parse("4", "8", gpus="a100:4")).offer.name == "gpu"
+    assert service.plan(Request.parse("4", "8", gpus="GPU:4")).offer.name == "gpu"
+    for gpus in ("A100", "H100:4"):
+        with pytest.raises(ComputeError, match="no configured offer"):
+            service.plan(Request.parse("4", "8", gpus=gpus))
+    data["offers"][0]["resources"]["accelerators"] = "GPU:4"
+    catalog.write_text(yaml.safe_dump(data))
+    with pytest.raises(ComputeError, match="no configured offer"):
+        compute.Compute().plan(Request.parse("4", "8", gpus="A100:4"))
+
+
+def test_builtin_catalog_stays_cpu_only_without_probing_native_gpus(
+    default_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
+    probe = MagicMock(side_effect=AssertionError("catalog loading must not probe GPU hardware"))
+    monkeypatch.setattr(subprocess, "run", probe)
+    loaded = Catalog.load()
+    assert [(offer.name, offer.resources.gpus) for offer in loaded.offers] == [
+        ("local", 0),
+    ]
+    probe.assert_not_called()
+    assert not list(default_home.iterdir())
+
+
+def test_configured_catalogs_do_not_probe_local_gpus(
+    catalog: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = MagicMock(side_effect=AssertionError("catalog loading must not probe GPU hardware"))
+    monkeypatch.setattr(subprocess, "run", probe)
+    assert Catalog.load().offers
+    probe.assert_not_called()
+
+
+def test_cli_gpu_request_and_resource_output(catalog: Path, provider: MagicMock) -> None:
+    data = yaml.safe_load(catalog.read_text())
+    data["offers"][0]["resources"]["accelerators"] = {"A100": 2}
+    catalog.write_text(yaml.safe_dump(data))
+    runner = CliRunner()
+    result = runner.invoke(main, [
+        "compute", "launch", "--cpus", "4", "--memory", "8", "--gpus", "A100:2",
+        "--dry-run", "--json",
+    ])
+    assert result.exit_code == 0, result.output
+    plan = json.loads(result.output)["plan"]
+    assert plan["request"]["resources"]["accelerators"] == {"A100": 2}
+    assert plan["resources"]["accelerators"] == {"A100": 2}
+    resources = runner.invoke(main, ["compute", "resources", "--json"])
+    assert json.loads(resources.output)["units"]["accelerators"] == "type and count per node"
+    rendered = runner.invoke(main, ["compute", "resources"]).output
+    assert "GPUS" in rendered and "A100:2" in rendered
+
+
+@pytest.mark.parametrize(
+    ("value", "seconds"),
+    [("1h30m", 5400), ("45s", 45), ("2d3h4m5s", 183845)],
+)
+def test_allocation_durations_accept_compound_units(value: str, seconds: int) -> None:
+    assert duration(value) == seconds
+    assert TimeLimits(default=value, max="3d").default_seconds == seconds
+    assert Request.parse("1", "1", time=value).seconds == seconds
+
+
+@pytest.mark.parametrize("value", ["", "0s", "1.5h", "30m1h", "1h30", 60, True])
+def test_allocation_duration_refuses_ambiguous_or_zero_values(value: object) -> None:
+    with pytest.raises(ValueError):
+        duration(value)
+    with pytest.raises(ValidationError):
+        TimeLimits(default=value, max="3d")
+    with pytest.raises(ComputeError):
+        Request.parse("1", "1", time=value)
+
+
 @pytest.mark.parametrize("size", [1, GIB // 2, 8 * GIB, 2**80 + 1])
 def test_resource_units_survive_construction_serialization_and_updates(size: int) -> None:
     whole, fraction = divmod(size, GIB)
@@ -410,7 +569,9 @@ def test_catalog_uses_the_public_models_and_roundtrips_without_an_adapter(catalo
         assert type(instance) is model
     assert "name" not in loaded.connections["test"].model_dump()
     dumped = loaded.model_dump(by_alias=True)
-    assert dumped["offers"][0]["resources"] == {"cpus": 4, "memory": Decimal(8)}
+    assert dumped["offers"][0]["resources"] == {
+        "cpus": 4, "memory": Decimal(8), "accelerators": None,
+    }
     assert dumped["offers"][0]["time"] == {"default": "30m", "max": "2h"}
     assert Catalog.model_validate(dumped) == loaded
     assert Catalog.model_validate_json(loaded.model_dump_json(by_alias=True)) == loaded
@@ -717,14 +878,14 @@ def test_cli_resources_dry_run_launch_down(catalog: Path, provider: MagicMock) -
     assert result.exit_code == 0, result.output
     resources = json.loads(result.output)
     assert [item["name"] for item in resources["offers"]] == ["quick", "large"]
-    assert resources["offers"][0]["resources"] == {"cpus": 4, "memory": 8}
+    assert resources["offers"][0]["resources"] == {"cpus": 4, "memory": 8, "accelerators": None}
     args = ["compute", "launch", "--cpus", "4", "--memory", "8", "--json"]
     result = runner.invoke(main, [*args, "--dry-run"])
     assert result.exit_code == 0, result.output
     plan = json.loads(result.output)["plan"]
     assert plan["offer"] == "quick"
     assert plan["connection"] == "test"
-    assert plan["resources"] == {"cpus": 4, "memory": 8}
+    assert plan["resources"] == {"cpus": 4, "memory": 8, "accelerators": None}
     assert plan["time_seconds"] == 1800
     assert plan["startup"] == "fast"
     assert "memory_gib" not in result.output
@@ -735,6 +896,16 @@ def test_cli_resources_dry_run_launch_down(catalog: Path, provider: MagicMock) -
     result = runner.invoke(main, ["compute", "down", IDENTITY.encode(), "--json"])
     assert result.exit_code == 0, result.output
     provider.terminate.assert_called_once_with(IDENTITY)
+
+
+def test_cli_resources_preserves_seconds(catalog: Path) -> None:
+    data = yaml.safe_load(catalog.read_text())
+    data["offers"][0]["time"] = {"default": "45s", "max": "1m30s"}
+    catalog.write_text(yaml.safe_dump(data))
+    result = CliRunner().invoke(main, ["compute", "resources"])
+    assert result.exit_code == 0, result.output
+    assert "45s" in result.output
+    assert "1m30s" in result.output
 
 
 def test_cli_launch_name_output_can_be_captured_without_json(

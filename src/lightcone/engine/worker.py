@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Literal
 
 from lightcone.engine import assets, container, dataset, identity, plan, project, sandbox
+from lightcone.engine.execution_resources import TaskResources
 from lightcone.engine.plan import Key, Task
 from lightcone.engine.project import (
     ProjectError,
@@ -227,6 +228,7 @@ def execute(
         ``ok`` with the output's ``data_version``, or ``failed``. Commits
         nothing and never touches git beyond reading HEAD.
     """
+    resources = TaskResources.parse(task.resources)
     if moved := _gate(root, context.env_version):
         return TaskResult(task.key, "failed", reason=moved)
 
@@ -239,17 +241,18 @@ def execute(
     # cannot reach a sibling, a longer id, another output's sidecar, or a
     # scope directory of the same name.
     task.output_path.parent.mkdir(parents=True, exist_ok=True)
-    task.manifest_path.unlink(missing_ok=True)
-    for stale in task.output_path.parent.glob(f"{task.output_id}.*"):
-        if stale.is_file() or stale.is_symlink():
-            stale.unlink()
-
     read_paths = [p for p in task.inputs.values() if p.exists()]
     policy = container.policy_for(
-        context.runtime, read_paths, write_dir=task.output_path.parent
+        context.runtime, read_paths, write_dir=task.output_path.parent,
+        use_gpus=resources.gpus > 0,
     )
-    started_at = _now()
     with sandbox.scope(policy):
+        # Validate device visibility and container support before removing outputs.
+        task.manifest_path.unlink(missing_ok=True)
+        for stale in task.output_path.parent.glob(f"{task.output_id}.*"):
+            if stale.is_file() or stale.is_symlink():
+                stale.unlink()
+        started_at = _now()
         outcome = sandbox.run(
             container.backend(context.runtime),
             policy,
@@ -414,7 +417,9 @@ def main(argv: list[str]) -> int:
         # This one-task run resolves its own runtime and HEAD, because it
         # *is* the driver here — the rule is that each is read once by
         # whoever owns the run, not that a worker never reads them.
-        runtime = container.runtime_for_run(root, build=False)
+        runtime = container.runtime_for_run(
+            root, build=False, use_gpus=TaskResources.parse(task.resources).gpus > 0,
+        )
         container.converge(runtime)
         result = execute(
             root,

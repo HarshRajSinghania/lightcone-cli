@@ -67,6 +67,13 @@ class Runtime:
     arch: str = ""
 
     @property
+    def supports_gpus(self) -> bool:
+        """Whether this execution mode can expose the allocation's GPUs."""
+        from lightcone.engine.sandbox.oci import supports_gpus
+
+        return self.mode == "direct" or supports_gpus(self.runtime)
+
+    @property
     def archive(self) -> str:
         """The committed archive, project-relative — what the run record's
         ``extra_inputs`` names. Derived through :func:`image.archive_path`
@@ -87,7 +94,7 @@ class Runtime:
         }
 
 
-def runtime_for_run(root: Path, *, build: bool) -> Runtime:
+def runtime_for_run(root: Path, *, build: bool, use_gpus: bool = False) -> Runtime:
     """Resolve the execution world, converging the image where allowed.
 
     The three image checks are repository questions first and runtime
@@ -102,6 +109,7 @@ def runtime_for_run(root: Path, *, build: bool) -> Runtime:
     Args:
         root: The project root.
         build: Whether a missing archive may be built and committed.
+        use_gpus: Refuse unsupported GPU containers before preparing their image.
 
     Returns:
         The resolved runtime; a direct-mode one costs a TOML read.
@@ -115,6 +123,10 @@ def runtime_for_run(root: Path, *, build: bool) -> Runtime:
         return Runtime(root=root, mode="direct", env_dir=project.env_dir(root))
 
     name = runtime_name(root)
+    if use_gpus:
+        from lightcone.engine.sandbox.oci import require_gpu_runtime
+
+        require_gpu_runtime(name)
     tag = image.tag(root)
     archive = image.archive_path(root, tag)
     if not _committed(archive):
@@ -408,7 +420,8 @@ def converge(runtime: Runtime) -> list[str]:
 
 
 def policy_for(
-    runtime: Runtime, read_paths: list[Path], *, write_dir: Path | None = None
+    runtime: Runtime, read_paths: list[Path], *, write_dir: Path | None = None,
+    use_gpus: bool = False,
 ) -> sandbox.Policy:
     """Build the exec policy for a resolved runtime.
 
@@ -422,16 +435,22 @@ def policy_for(
         runtime: The resolved runtime.
         read_paths: Declared inputs, as :func:`sandbox.exec_policy` takes.
         write_dir: The directory a recipe's output lands in; absent for a probe.
+        use_gpus: Inherit the allocation's CUDA mask; otherwise hide GPUs.
 
     Returns:
         The policy for this world.
     """
+    if use_gpus and runtime.mode == "containerized":
+        from lightcone.engine.sandbox.oci import require_gpu_runtime
+
+        require_gpu_runtime(runtime.runtime)
     return sandbox.exec_policy(
         runtime.root,
         read_paths=read_paths,
         env_dir=runtime.env_dir,
         containerized=runtime.mode == "containerized",
         write_dir=write_dir,
+        use_gpus=use_gpus,
     )
 
 
@@ -682,5 +701,3 @@ def _machine_preflight(root: Path) -> None:
             f"empty. Share it:\n  podman machine stop\n"
             f"  podman machine set --volume {root}\n  podman machine start"
         )
-
-

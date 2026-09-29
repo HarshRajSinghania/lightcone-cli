@@ -8,11 +8,13 @@ here with nothing spawned and no runtime installed.
 from __future__ import annotations
 
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from lightcone.engine.project import ProjectError
 from lightcone.engine.sandbox import boundary, exec_policy
 from lightcone.engine.sandbox.boundary import Unavailable
 from lightcone.engine.sandbox.model import Policy
@@ -183,6 +185,43 @@ def test_runtimes_differ_only_in_their_spellings(root: Path, policy: Policy) -> 
     }  # fmt: skip
     p, d, h = ([a for a in argv if a not in strip] for argv in (podman, docker, hpc))
     assert p == d == h
+
+
+def test_podman_hpc_preserves_the_allocation_mask_and_enables_native_gpu_support(
+    root: Path, policy: Policy,
+) -> None:
+    devices = "2,0"
+    selected = replace(policy, env={
+        **policy.env, "CUDA_VISIBLE_DEVICES": devices, "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+    })
+    backend = _backend(root, "podman-hpc")
+    argv = backend.wrap(selected, ["true"])
+    assert argv == backend.wrap(selected, ["true"])
+    assert f"--env=CUDA_VISIBLE_DEVICES={devices}" in argv
+    assert "--env=CUDA_DEVICE_ORDER=PCI_BUS_ID" in argv
+    assert "--gpu" in argv
+    assert not any(arg.startswith("--device=") for arg in argv)
+
+
+@pytest.mark.parametrize("runtime", ["podman", "docker"])
+def test_generic_gpu_containers_are_explicitly_refused(
+    root: Path, policy: Policy, runtime: str,
+) -> None:
+    selected = replace(policy, env={**policy.env, "CUDA_VISIBLE_DEVICES": "2,0"})
+    with pytest.raises(ProjectError, match="GPU containers require podman-hpc"):
+        _backend(root, runtime).wrap(selected, ["true"])
+
+
+@pytest.mark.parametrize("runtime", ["podman", "docker", "podman-hpc"])
+def test_cpu_containers_do_not_request_gpu_access(root: Path, policy: Policy, runtime: str) -> None:
+    policy = replace(policy, env={**policy.env, "NVIDIA_VISIBLE_DEVICES": "all"})
+    argv = _backend(root, runtime).wrap(policy, ["true"])
+    assert "--env=CUDA_VISIBLE_DEVICES=" in argv
+    assert "--env=NVIDIA_VISIBLE_DEVICES=void" in argv
+    assert "--env=NVIDIA_VISIBLE_DEVICES=all" not in argv
+    assert policy.env["NVIDIA_VISIBLE_DEVICES"] == "all"
+    assert "--gpu" not in argv and "--gpus" not in argv
+    assert not any(arg.startswith("--device=") for arg in argv)
 
 
 def test_the_environment_is_an_allowlist_never_ambient(

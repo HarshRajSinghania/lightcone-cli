@@ -40,7 +40,9 @@ lc materialize "$CLUSTER"
   │  refuse: dirty tree
   │  plan: astra validate + resolve  →  Graph of Tasks
   │        (no tasks → converge the crate and stop; nothing connects)
+  │  classify: current/behind outputs become values; other outputs may run
   │  connect: native identity + Dask readiness
+  │  admit: resource requests for outputs that may run fit a worker
   │  fetch: git annex get (declared inputs not in this clone)
   │  converge: uv.lock ⇄ .venv   (and the image, containerized)
   ├─► workers: reset output file → sandbox → recipe → hash → manifest
@@ -57,13 +59,22 @@ The division of labor is strict and load-bearing:
   `TaskResult`; the driver commits as results arrive, in one thread.
   Concurrent git operations race on the index lock — this split is not
   a preference.
-- **Dask owns the ordering.** Every task is submitted with its
-  upstream futures as arguments; there is no ready-set loop or
+- **Dask owns the ordering.** Tasks that may execute are submitted with their
+  upstream futures or already-current values as arguments; there is no ready-set loop or
   hand-rolled topological sort on the execution path.
 - **The worker never raises.** A recipe failure, a gate failure, an
   unreadable manifest — all come back as a state, so one failure
   doesn't abort every task in flight, and a run reports *all* its
   independent failures.
+- **Dask accounts for task resources.** Workers advertise CPU, memory, and GPU
+  budgets; submissions reserve the recipe's requirements. Omitted memory adds no
+  RAM reservation. These coordinate scheduling rather than imposing per-recipe
+  OS limits or numerical-library thread counts.
+  Recipe `time_limit` is explicitly refused; allocation walltime remains supported.
+  A GPU recipe reserves the worker's full GPU budget and inherits its allocation
+  mask, even when it requests fewer GPUs. CPU recipes expose none; probes reserve
+  the whole worker budget. Direct and podman-hpc probes use the allocation mask,
+  while ordinary Docker and Podman probes use no GPUs.
 - **Values are resolved once and handed down.** HEAD, the container
   runtime, and the foreign-write facts are read by the driver and
   passed to workers as values — a worker that asked git itself could
@@ -135,9 +146,10 @@ Because every backend is a pure argv rewrite, all of them are testable
 on a host that can't run them, and the manifest's `hermeticity` field
 records what was *actually* enforced — never what should have been.
 
-There is one policy, `exec_policy`: probe and recipe get exactly the
-same thing (tree read-only apart from `results/`), so "works under
-`lc run`" and "works as a recipe" stay the same fact.
+There is one policy builder, `exec_policy`: probes and recipes share environment
+and filesystem rules, with write scope and GPU visibility supplied by the caller.
+GPU recipes and supported probes inherit the worker's allocation mask; CPU
+commands get an empty mask.
 
 ## The container hatch
 
@@ -157,17 +169,26 @@ config-blob id, never a tag.
 `engine.compute` owns allocation lifecycle through a small provider protocol.
 A YAML catalog supplies ordered resource offers and stable native service
 namespaces. When the implicit default file is absent, a built-in local catalog
-provides one CPU and 1 GiB without setup. An explicit catalog replaces that default;
-missing explicit paths and invalid files remain errors. No catalog is written and
+provides one CPU and 1 GiB without setup. GPU offers need an explicit catalog,
+which replaces the built-in defaults. Missing explicit paths and invalid files
+remain errors. No catalog is written and
 no allocation starts until `compute launch` resolves resources and submits once. Slurm queries
 and validated local OS identities are authoritative for allocations; Dask is the
 authority for connected workers. Private scheduler/TLS files are connection
 material, not a registry.
 
+Allocation requests use SkyPilot-style CPU/memory exact or minimum quantities
+and one accelerator type/count. Providers translate those requests into native
+allocations; Lightcone does not depend on SkyPilot or carry its GPU alias registry.
+Stock Dask workers inherit the allocation's native CUDA mask; Lightcone does not
+probe GPU hardware. Container GPU access uses podman-hpc's native `--gpu` option.
+See [GPU setup](user/cluster.md#gpu-allocations).
+
 `compute.connect(CLUSTER_ID)` borrows a standard Dask client and closes only that
 client on exit. Both execution commands require a cluster ID. The materialization
-scheduler keeps its `submit`/`completed` seam. Driver preparation and existing
-task runtime/sandbox checks remain unchanged. Tasks use ordinary Dask scheduling;
+scheduler validates resource requests, then keeps its `submit`/`completed` seam.
+Driver preparation and existing task runtime/sandbox checks remain unchanged.
+Tasks use ordinary Dask scheduling;
 there is no separate worker-selection or preflight layer, or site-marker guard. No execution command implicitly allocates compute.
 See [compute internals](api/compute.md) and [deployment limits](user/cluster.md).
 

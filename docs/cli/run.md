@@ -2,9 +2,8 @@
 
 Run an ad-hoc command in the project environment, under isolation.
 This is the probe verb: it executes exactly one command the way a
-recipe would be executed — same environment, same sandbox — so "does
-it work under `lc run`?" and "will it work as a recipe?" are the same
-question.
+recipe would be executed — same environment, same sandbox. Recipes must also
+declare the resources they need, including their GPU count.
 
 ## Synopsis
 
@@ -39,6 +38,13 @@ allocation environment. Prefixing the CLI with `NAME=value` does not forward
 that variable to an existing cluster. Set command-specific values inside the
 command, for example `lc run "$CLUSTER" -- env NAME=value python script.py`.
 Containerized commands use the image's environment and the sandbox overlays.
+
+The command reserves one worker's full CPU, memory, and GPU budgets for its duration.
+Direct and podman-hpc probes inherit the allocation's whole CUDA mask. Ordinary
+Docker and Podman probes run without GPUs and report that limitation, even on a
+GPU allocation. CPU-only allocations expose no GPUs. A recipe declares its
+minimum GPU count explicitly; unsupported GPU recipes fail before image preparation.
+See [GPU allocations](../user/cluster.md#gpu-allocations) for container prerequisites.
 
 Interrupting the CLI detaches its client; the remote command may still be running.
 Stop the allocation with `lc compute down` and its full ID (a name can already
