@@ -1726,14 +1726,15 @@ Resolve the Slurm command user's UID through `id -u` on the same command runner,
 and use it for every native ownership check and filter.
 
 **Local compute needs no setup.** The built-in local offer provides detected usable
-logical CPUs and RAM, one node, fast startup, a 30-minute default and two-hour
-maximum lifetime. Loading the catalog writes no catalog and starts no cluster.
+logical CPUs and RAM, one node, fast startup, no walltime and a 30-minute idle
+timeout. Loading the catalog writes no catalog and starts no cluster.
 `lc compute launch` without CPU/memory flags selects only local offers and defaults
 the name to `local`. `--wait` returns when the accepted allocation is ready; timeout
 or startup failure retains its ID without resubmitting or terminating it.
 Configured remote offers precede the built-in local offer in selection order.
 Explicit local connections supply their own offers instead. `local.resources`
-overrides the built-in CPU/RAM budget and cannot accompany explicit local connections.
+and `local.time` override the built-in CPU/RAM budget and time limits and cannot
+accompany explicit local connections.
 `local.enabled: false` blocks local launch and execution while preserving inspection
 and termination. Recognized NERSC login nodes disable local compute automatically;
 other sites can disable it in their catalogs. Native permissions remain the
@@ -2133,6 +2134,34 @@ unlinks before writing; a new tampering test should too.
   restriction also covers copied or incomplete catalogs; no generated file or
   override flag is needed. Local compute in interactive compute-node sessions
   remains available, subject to the configured local policy.
+
+- **Local compute ends when idle, not at a fixed age (2026-09, issue #233).**
+  An offer's `time` is `{default?, max?, idle?}` and needs a `default` or an
+  `idle`; the built-in local offer is `{idle: 30m}`, so a long recipe finishes
+  and the cluster stops 30 minutes after the last task. `idle` is handed to the
+  scheduler as Dask's own `idle_timeout` — its activity test (running, queued or
+  unrunnable tasks and any transition reset it; clients and `scheduler_info`
+  polls do not, measured) rather than a tracker of ours. `--time` stays a hard
+  walltime (SIGALRM, unconditional on activity); with both, the first to fire
+  ends the allocation, and the built-in offer has no `max` because a ceiling on
+  `--time` is meaningless when omitting it means unbounded. When the scheduler
+  closes without the owner asking (no SIGTERM yet), a `SchedulerPlugin.close`
+  hook records the reason in `error.json` and SIGKILLs the session itself, like
+  the walltime path — from the hook, so a scheduler that idles out before
+  `LocalCluster(...)` returns still ends the owner, and never through
+  `LocalCluster`'s own close, which waits ~34 s on the departed scheduler
+  (measured), holding the one-per-machine slot and the name. `SCHEDULER_CONFIG`
+  pins `idle-timeout: None`, so only an offer sets one — ambient Dask config
+  reaches neither local nor Slurm schedulers. `compute.connect` (execution only;
+  `status` connects through the provider) submits one no-op task, so a
+  driver's preparation — annex fetch, image build, sync — starts with a full
+  countdown. Slurm refuses `time.idle` and still needs `time.default`: its
+  allocations end at the native walltime, and an ignored idle timeout would be
+  a lie. Accepted residue: a preparation longer than the timeout still loses
+  the cluster; a driver pausing between tasks (a long annex commit) counts as
+  idle; and without `--time` nothing bounds an owner whose scheduler loop
+  wedges — the walltime's SIGALRM was that bound, and a second timer only for
+  it was judged not worth its code.
 
 - **Local compute accompanies remote catalogs (2026-09).** The built-in offer
   uses the host's usable CPU/RAM capacity and follows configured offers, replacing

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import signal
@@ -15,12 +16,13 @@ import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import DEFAULT, MagicMock
 from uuid import uuid4
 
 import psutil
 import pytest
 from click.testing import CliRunner
+from distributed import fire_and_forget
 
 from lightcone.cli.commands import main
 from lightcone.engine.compute import Compute, local, local_runtime
@@ -61,10 +63,13 @@ def provider(tmp_path: Path) -> LocalProvider:
     )
 
 
-def _launch(provider: LocalProvider, *, seconds: int = 60) -> Identity:
+def _launch(
+    provider: LocalProvider, *, seconds: int | None = 60, idle: str | None = None,
+) -> Identity:
     offer = Offer(
         name="small", connection="workstation", resources=Resources(cpus=1, memory_gib=0.5),
-        max_nodes=1, time=TimeLimits(default="1m", max="1m"),
+        max_nodes=1,
+        time=TimeLimits(default="1m", max="1m") if idle is None else TimeLimits(idle=idle),
     )
     return provider.launch(
         provider.plan(offer, Request(cpus=1, memory_bytes=512 * 1024**2, seconds=seconds))
@@ -502,6 +507,90 @@ def test_walltime_expires_without_a_connected_client(provider: LocalProvider) ->
     finally:
         for allocation in identities:
             provider.terminate(allocation)
+
+
+def test_an_unused_allocation_idles_out_despite_status_polling_and_frees_its_name(
+    provider: LocalProvider, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = tmp_path / "compute.yaml"
+    catalog.write_text(json.dumps({
+        "version": 1,
+        "connections": {
+            "workstation": {
+                "provider": "local",
+                "namespace": provider.connection.namespace,
+                "launch": provider.connection.launch,
+            },
+        },
+        "offers": [{
+            "name": "small",
+            "connection": "workstation",
+            "resources": {"cpus": 1, "memory": 0.5},
+            "max_nodes": 1,
+            "time": {"idle": "8s"},
+        }],
+    }))
+    monkeypatch.setenv("LC_COMPUTE_CONFIG", str(catalog))
+    plan = Compute().plan(Request(cpus=1, memory_bytes=512 * 1024**2), name="analysis")
+    assert (plan.seconds, plan.idle_seconds) == (None, 8)
+    identities = []
+    try:
+        first = Compute().launch(plan)
+        identities.append(first)
+        assert Compute().status("analysis", wait=True, timeout=20).ready
+        # Each status query connects a client; none of them is task activity.
+        deadline = time.monotonic() + 20
+        while Compute().status(first.encode()).phase != "ended":
+            assert time.monotonic() < deadline, "an unused allocation outlived its idle timeout"
+            time.sleep(0.2)
+        assert "idle timeout" in Compute().status(first.encode()).reason
+        assert Compute().discover() == ([], {})
+        # The ended owner no longer holds this machine's one local allocation, or its name.
+        second = Compute().launch(plan)
+        identities.append(second)
+        assert second.name == "analysis"
+        assert Compute().status("analysis", wait=True, timeout=20).identity == second
+    finally:
+        for identity in identities:
+            provider.terminate(identity)
+
+
+def test_work_outlasts_the_idle_timeout_and_new_work_restarts_it(
+    provider: LocalProvider,
+) -> None:
+    identity = _launch(provider, seconds=None, idle="8s")
+    try:
+        _ready(provider, identity)
+        with provider.connect(identity) as client:
+            # One task slot: the second task queues behind the first.
+            assert client.gather(client.map(time.sleep, [5, 5], pure=False)) == [None, None]
+            finished = time.monotonic()
+            time.sleep(5)
+            assert client.submit(sum, [1, 2]).result(timeout=5) == 3
+            restarted = time.monotonic()
+        # Without the restart, the allocation would have ended about 8s after `finished`.
+        time.sleep(max(0.0, finished + 9.5 - time.monotonic()))
+        assert provider.inspect(identity).phase == "active"
+        _ended(provider, identity, timeout=max(1.0, restarted + 10 - time.monotonic()))
+    finally:
+        provider.terminate(identity)
+
+
+def test_an_explicit_walltime_interrupts_active_work_despite_an_idle_timeout(
+    provider: LocalProvider,
+) -> None:
+    identity = _launch(provider, seconds=10, idle="1m")
+    try:
+        _ready(provider, identity)
+        with provider.connect(identity) as client:
+            fire_and_forget(client.submit(time.sleep, 60, pure=False))
+            deadline = time.monotonic() + 5
+            while not any(client.processing().values()):
+                assert time.monotonic() < deadline, "the task never started"
+                time.sleep(0.05)
+        _ended(provider, identity, timeout=15)
+    finally:
+        provider.terminate(identity)
 
 
 @pytest.mark.parametrize("ending", ["down", "walltime"])
@@ -1020,7 +1109,7 @@ def test_private_material_rejects_symlinks_broad_modes_and_hardlinks(tmp_path: P
         read_private_json(path)
 
 
-def test_local_plan_is_one_node_finite_cooperative_and_does_not_allocate(
+def test_local_plan_is_one_node_bounded_cooperative_and_does_not_allocate(
     provider: LocalProvider,
 ) -> None:
     offer = Offer(
@@ -1032,7 +1121,7 @@ def test_local_plan_is_one_node_finite_cooperative_and_does_not_allocate(
     assert "cooperative" in plan.details["resource_enforcement"]
     with pytest.raises(ComputeError, match="one execution node"):
         provider.plan(offer, Request(cpus=1, memory_bytes=512 * 1024**2, num_nodes=2))
-    with pytest.raises(ComputeError, match="finite time"):
+    with pytest.raises(ComputeError, match="exceeds the local offer's maximum"):
         provider.plan(offer, Request(cpus=1, memory_bytes=512 * 1024**2, seconds=61))
 
 
@@ -1272,6 +1361,7 @@ def test_local_gpu_offers_are_unavailable_outside_linux(
 def test_local_runtime_advertises_configured_resources_and_preserves_native_gpu_mask(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gpus: int | None,
 ) -> None:
+    import dask
     import distributed
 
     directory = private_directory(tmp_path / "allocation", create=True)
@@ -1294,17 +1384,34 @@ def test_local_runtime_advertises_configured_resources_and_preserves_native_gpu_
     monkeypatch.setattr(local_runtime, "create_security", lambda _: None)
     cluster = MagicMock()
     cluster.return_value.__enter__.return_value.scheduler.id = "Scheduler-gpu"
+    ambient: dict[str, object] = {}
+
+    def build(**_: object) -> object:
+        ambient["idle"] = dask.config.get("distributed.scheduler.idle-timeout")
+        return DEFAULT
+
+    cluster.side_effect = build
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "killpg", lambda *args: killed.append(args))
     monkeypatch.setattr(distributed, "LocalCluster", cluster)
 
     startup_read, startup_write = os.pipe()
     os.write(startup_write, b"1")
     os.close(startup_write)
     write_private_json(directory / "launch.json", {
-        "identity": "allocation", "deadline": time.monotonic() + 60,
+        "identity": "allocation", "deadline": time.monotonic() + 60, "idle_timeout": 30,
         "task_slots": 1, "scratch": str(scratch), "startup_fd": startup_read,
     })
     # The runtime owns and closes its startup reader; closing it here again
     # could close whatever descriptor reused the number since.
-    local_runtime.main()
+    with dask.config.set({"distributed.scheduler.idle-timeout": "10m"}):
+        local_runtime.main()
+    # The offer's idle timeout reaches the scheduler; an ambient one never does.
+    assert ambient["idle"] is None
     assert cluster.call_args.kwargs["resources"] == {"CPU": 1, "MEMORY": 1024**3, "GPU": gpus or 0}
+    scheduler_kwargs = cluster.call_args.kwargs["scheduler_kwargs"]
+    assert scheduler_kwargs["idle_timeout"] == 30
+    # A close the owner asked for is Dask's graceful one, never the session kill.
+    asyncio.run(scheduler_kwargs["plugins"][0].close())
+    assert killed == []
     assert os.environ["CUDA_VISIBLE_DEVICES"] == ("3,1" if gpus else "")
